@@ -14,6 +14,29 @@ from tqdm import tqdm
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
 from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames
 
+from PIL import Image
+import io
+import numpy as np
+
+def _load_img_bytes_as_tensor(img_data, image_size):
+    img_pil = Image.open(io.BytesIO(img_data))
+    img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
+    if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
+        img_np = img_np / 255.0
+    else:
+        raise RuntimeError(f"Unknown image dtype: {img_np.dtype}")
+    img = torch.from_numpy(img_np).permute(2, 0, 1)
+    video_width, video_height = img_pil.size  # the original video size
+
+    img = torch.zeros(1, 3, image_size, image_size, dtype=torch.float32)
+    img[0] = img
+    img_mean=(0.485, 0.456, 0.406)
+    img_std=(0.229, 0.224, 0.225)
+    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+    img -= img_mean
+    img /= img_std
+    return img, video_height, video_width
 
 class SAM2VideoPredictor(SAM2Base):
     """The predictor class to handle user interactions and manage inference states."""
@@ -39,6 +62,106 @@ class SAM2VideoPredictor(SAM2Base):
         self.clear_non_cond_mem_around_input = clear_non_cond_mem_around_input
         self.clear_non_cond_mem_for_multi_obj = clear_non_cond_mem_for_multi_obj
         self.add_all_frames_to_correct_as_cond = add_all_frames_to_correct_as_cond
+
+    """
+    load each image as this:
+    def _load_img_as_tensor(img_path, image_size):
+        img_pil = Image.open(img_path)
+        img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
+        if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
+            img_np = img_np / 255.0
+        else:
+            raise RuntimeError(f"Unknown image dtype: {img_np.dtype} on {img_path}")
+        img = torch.from_numpy(img_np).permute(2, 0, 1)
+        video_width, video_height = img_pil.size  # the original video size
+        return img, video_height, video_width
+
+    images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
+    for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
+        images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
+    if not offload_video_to_cpu:
+        images = images.to(compute_device)
+        img_mean = img_mean.to(compute_device)
+        img_std = img_std.to(compute_device)
+    # normalize by mean and std
+    images -= img_mean
+    images /= img_std
+    return images, video_height, video_width
+
+    So each image in order, load it in and manage it as _load_img_as_tensor. Then save them into the images torch tensor in the right way. Then normalize. 
+    """
+
+    @torch.inference_mode()
+    def non_video_path_init_state(
+        self,
+        single_image_bytes,
+        offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
+        async_loading_frames=False,
+    ):
+        """Initialize an inference state."""
+        compute_device = self.device  # device of the model
+        #images, video_height, video_width = load_video_frames(
+        #    video_path=video_path,
+        #    image_size=self.image_size,
+        #    offload_video_to_cpu=offload_video_to_cpu,
+        #    async_loading_frames=async_loading_frames,
+        #    compute_device=compute_device,
+        #)
+        images, video_height, video_width = _load_img_bytes_as_tensor(single_image_bytes[0], self.image_size)
+        print("self.image_size=", self.image_size)
+        inference_state = {}
+        inference_state["images"] = images
+        inference_state["num_frames"] = len(images)
+        # whether to offload the video frames to CPU memory
+        # turning on this option saves the GPU memory with only a very small overhead
+        inference_state["offload_video_to_cpu"] = offload_video_to_cpu
+        # whether to offload the inference state to CPU memory
+        # turning on this option saves the GPU memory at the cost of a lower tracking fps
+        # (e.g. in a test case of 768x768 model, fps dropped from 27 to 24 when tracking one object
+        # and from 24 to 21 when tracking two objects)
+        inference_state["offload_state_to_cpu"] = offload_state_to_cpu
+        # the original video height and width, used for resizing final output scores
+        inference_state["video_height"] = video_height
+        inference_state["video_width"] = video_width
+        inference_state["device"] = compute_device
+        if offload_state_to_cpu:
+            inference_state["storage_device"] = torch.device("cpu")
+        else:
+            inference_state["storage_device"] = compute_device
+        # inputs on each frame
+        inference_state["point_inputs_per_obj"] = {}
+        inference_state["mask_inputs_per_obj"] = {}
+        # visual features on a small number of recently visited frames for quick interactions
+        inference_state["cached_features"] = {}
+        # values that don't change across frames (so we only need to hold one copy of them)
+        inference_state["constants"] = {}
+        # mapping between client-side object id and model-side object index
+        inference_state["obj_id_to_idx"] = OrderedDict()
+        inference_state["obj_idx_to_id"] = OrderedDict()
+        inference_state["obj_ids"] = []
+        # A storage to hold the model's tracking results and states on each frame
+        inference_state["output_dict"] = {
+            "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+            "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+        }
+        # Slice (view) of each object tracking results, sharing the same memory with "output_dict"
+        inference_state["output_dict_per_obj"] = {}
+        # A temporary storage to hold new outputs when user interact with a frame
+        # to add clicks or mask (it's merged into "output_dict" before propagation starts)
+        inference_state["temp_output_dict_per_obj"] = {}
+        # Frames that already holds consolidated outputs from click or mask inputs
+        # (we directly use their consolidated outputs during tracking)
+        inference_state["consolidated_frame_inds"] = {
+            "cond_frame_outputs": set(),  # set containing frame indices
+            "non_cond_frame_outputs": set(),  # set containing frame indices
+        }
+        # metadata for each tracking frame (e.g. which direction it's tracked)
+        inference_state["tracking_has_started"] = False
+        inference_state["frames_already_tracked"] = {}
+        # Warm up the visual backbone and cache the image feature on frame 0
+        self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+        return inference_state
 
     @torch.inference_mode()
     def init_state(

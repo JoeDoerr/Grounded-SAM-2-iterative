@@ -25,7 +25,6 @@ COPY . /home/appuser/Grounded-SAM-2/
 
 WORKDIR /home/appuser/Grounded-SAM-2
 
-
 # Install essential Python packages
 RUN python -m pip install --upgrade pip setuptools wheel numpy \
     opencv-python transformers supervision pycocotools addict yapf timm
@@ -35,3 +34,13 @@ RUN python -m pip install -e .
 
 # Install grounding dino 
 RUN python -m pip install --no-build-isolation -e grounding_dino
+
+RUN ls -la
+WORKDIR /home/appuser/Grounded-SAM-2/checkpoints
+RUN ls -la
+RUN bash download_ckpts.sh
+WORKDIR /home/appuser/Grounded-SAM-2/gdino_checkpoints
+RUN bash download_ckpts.sh
+
+WORKDIR /home/appuser/Grounded-SAM-2
+#RUN python huggingface_downloads.py
