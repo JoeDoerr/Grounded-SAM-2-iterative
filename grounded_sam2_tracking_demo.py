@@ -110,7 +110,7 @@ def first_step(text, first_frame_list):
         masks = masks.squeeze(1)
 
     """
-    Step 3: Register each object's positive points to video predictor with seperate add_new_points call
+    Step 3: Register each object's positive points to video predictor with separate add_new_points call
     """
 
     PROMPT_TYPE_FOR_VIDEO = "box" # or "point"
@@ -205,8 +205,8 @@ def main():
     buffer.close()
 
     video_predictor, inference_state, masks = first_step("car.", [img_bytes])
-    print(masks.shape)
-    print(masks)
+    print("mask shapes", masks.shape)
+    #print(masks)
 
     img = cv2.imread(image_path)
     for mask in masks:
@@ -259,6 +259,6 @@ for frame_idx, segments in video_segments.items():
 #Step 6: Convert the annotated frames to video
 
 
-output_video_path = "./children_tracking_demo_video.mp4"
+output_video_path = "./tracking_demo_video.mp4"
 create_video_from_images(save_dir, output_video_path)
 """
