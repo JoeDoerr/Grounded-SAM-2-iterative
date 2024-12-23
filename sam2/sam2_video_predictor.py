@@ -17,6 +17,7 @@ from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video
 from PIL import Image
 import io
 import numpy as np
+from sam2.utils.misc import load_video_frames_from_jpg_images, _load_img_as_tensor
 
 def _load_img_bytes_as_tensor(img_data, image_size):
     img_pil = Image.open(io.BytesIO(img_data))
@@ -37,6 +38,70 @@ def _load_img_bytes_as_tensor(img_data, image_size):
     img -= img_mean
     img /= img_std
     return img, video_height, video_width
+
+def load_single_image(
+    img_path,
+    image_size,
+    offload_to_cpu=False,
+    img_mean=(0.485, 0.456, 0.406),
+    img_std=(0.229, 0.224, 0.225),
+    compute_device=torch.device("cuda"),
+):
+    """
+    Load and preprocess a single image from a given path.
+
+    The image is resized to image_size x image_size and is loaded to GPU if
+    `offload_to_cpu` is `False` and to CPU if `offload_to_cpu` is `True`.
+    """
+    # Convert mean and std to tensors
+    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+
+    # Load the image as a tensor
+    image, video_height, video_width = _load_img_as_tensor(img_path, image_size)
+
+    # Move to the appropriate device
+    if not offload_to_cpu:
+        image = image.to(compute_device)
+        img_mean = img_mean.to(compute_device)
+        img_std = img_std.to(compute_device)
+
+    # Normalize the image
+    image -= img_mean
+    image /= img_std
+
+    image = image.unsqueeze(0)
+    print("image shape", image.shape)
+
+    return image, video_height, video_width
+
+def images_from_paths(img_paths, image_size):
+    #return_images = torch.zeros(1, 3, image_size, image_size, dtype=torch.float32)
+    it=0
+    for path in img_paths:
+        img_pil = Image.open(path)
+        img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
+        if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
+            img_np = img_np / 255.0
+        else:
+            raise RuntimeError(f"Unknown image dtype: {img_np.dtype}")
+        img = torch.from_numpy(img_np).permute(2, 0, 1)
+        video_width, video_height = img_pil.size  # the original video size
+
+        img = torch.zeros(1, 3, image_size, image_size, dtype=torch.float32)
+        img[0] = img
+        img_mean=(0.485, 0.456, 0.406)
+        img_std=(0.229, 0.224, 0.225)
+        img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+        img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+        img -= img_mean
+        img /= img_std
+        if it == 0:
+            return_images = img
+        else:
+            return_images = torch.cat((return_images, img), dim=0)
+        it+=1
+    return return_images, video_height, video_width
 
 class SAM2VideoPredictor(SAM2Base):
     """The predictor class to handle user interactions and manage inference states."""
@@ -94,7 +159,7 @@ class SAM2VideoPredictor(SAM2Base):
     @torch.inference_mode()
     def non_video_path_init_state(
         self,
-        single_image_bytes,
+        images,
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
@@ -108,8 +173,83 @@ class SAM2VideoPredictor(SAM2Base):
         #    async_loading_frames=async_loading_frames,
         #    compute_device=compute_device,
         #)
-        images, video_height, video_width = _load_img_bytes_as_tensor(single_image_bytes[0], self.image_size)
+        # if len(single_image_bytes) == 1:
+        #     images, video_height, video_width = load_single_image(single_image_bytes[0], self.image_size)
+        # else:
+        #     images, video_height, video_width = load_single_image(single_image_bytes[0], self.image_size)
+        #     for i in range(len(single_image_bytes)):
+        #         image_next, video_height, video_width = load_single_image(single_image_bytes[i], self.image_size)
+        #         images = torch.cat((images, image_next), dim=0)
+            
         print("self.image_size=", self.image_size)
+        inference_state = {}
+        inference_state["images"] = images
+        inference_state["num_frames"] = len(images)
+        # whether to offload the video frames to CPU memory
+        # turning on this option saves the GPU memory with only a very small overhead
+        inference_state["offload_video_to_cpu"] = offload_video_to_cpu
+        # whether to offload the inference state to CPU memory
+        # turning on this option saves the GPU memory at the cost of a lower tracking fps
+        # (e.g. in a test case of 768x768 model, fps dropped from 27 to 24 when tracking one object
+        # and from 24 to 21 when tracking two objects)
+        inference_state["offload_state_to_cpu"] = offload_state_to_cpu
+        # the original video height and width, used for resizing final output scores
+        inference_state["video_height"] = video_height
+        inference_state["video_width"] = video_width
+        inference_state["device"] = compute_device
+        if offload_state_to_cpu:
+            inference_state["storage_device"] = torch.device("cpu")
+        else:
+            inference_state["storage_device"] = compute_device
+        # inputs on each frame
+        inference_state["point_inputs_per_obj"] = {}
+        inference_state["mask_inputs_per_obj"] = {}
+        # visual features on a small number of recently visited frames for quick interactions
+        inference_state["cached_features"] = {}
+        # values that don't change across frames (so we only need to hold one copy of them)
+        inference_state["constants"] = {}
+        # mapping between client-side object id and model-side object index
+        inference_state["obj_id_to_idx"] = OrderedDict()
+        inference_state["obj_idx_to_id"] = OrderedDict()
+        inference_state["obj_ids"] = []
+        # A storage to hold the model's tracking results and states on each frame
+        inference_state["output_dict"] = {
+            "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+            "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+        }
+        # Slice (view) of each object tracking results, sharing the same memory with "output_dict"
+        inference_state["output_dict_per_obj"] = {}
+        # A temporary storage to hold new outputs when user interact with a frame
+        # to add clicks or mask (it's merged into "output_dict" before propagation starts)
+        inference_state["temp_output_dict_per_obj"] = {}
+        # Frames that already holds consolidated outputs from click or mask inputs
+        # (we directly use their consolidated outputs during tracking)
+        inference_state["consolidated_frame_inds"] = {
+            "cond_frame_outputs": set(),  # set containing frame indices
+            "non_cond_frame_outputs": set(),  # set containing frame indices
+        }
+        # metadata for each tracking frame (e.g. which direction it's tracked)
+        inference_state["tracking_has_started"] = False
+        inference_state["frames_already_tracked"] = {}
+        # Warm up the visual backbone and cache the image feature on frame 0
+        self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+        return inference_state
+
+    @torch.inference_mode()
+    def init_state_joe(
+        self,
+        image_paths,
+        offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
+        async_loading_frames=False,
+    ):
+        """Initialize an inference state."""
+        compute_device = self.device  # device of the model
+
+
+        #images, video_height, video_width = images_from_paths(image_paths, self.image_size)
+        images, video_height, video_width = load_video_frames_from_jpg_images(image_paths, self.image_size, False)
+        
         inference_state = {}
         inference_state["images"] = images
         inference_state["num_frames"] = len(images)
@@ -823,6 +963,8 @@ class SAM2VideoPredictor(SAM2Base):
             )
             processing_order = range(start_frame_idx, end_frame_idx + 1)
 
+        print("starting idx", start_frame_idx, "with processing order", processing_order)
+
         for frame_idx in tqdm(processing_order, desc="propagate in video"):
             # We skip those frames already in consolidated outputs (these are frames
             # that received input clicks or mask). Note that we cannot directly run
@@ -853,6 +995,74 @@ class SAM2VideoPredictor(SAM2Base):
                     run_mem_encoder=True,
                 )
                 output_dict[storage_key][frame_idx] = current_out
+            # Create slices of per-object outputs for subsequent interaction with each
+            # individual object after tracking.
+            self._add_output_per_object(
+                inference_state, frame_idx, current_out, storage_key
+            )
+            inference_state["frames_already_tracked"][frame_idx] = {"reverse": reverse}
+
+            # Resize the output mask to the original video resolution (we directly use
+            # the mask scores on GPU for output to avoid any CPU conversion in between)
+            _, video_res_masks = self._get_orig_video_res_output(
+                inference_state, pred_masks
+            )
+            yield frame_idx, obj_ids, video_res_masks
+
+    @torch.inference_mode()
+    def propagate_in_video_after_start(
+        self,
+        inference_state,
+        start_frame_idx=None,
+        max_frame_num_to_track=None,
+        reverse=False,
+    ):
+        """Propagate the input points across frames to track in the entire video."""
+        #self.propagate_in_video_preflight(inference_state)
+
+        output_dict = inference_state["output_dict"]
+        consolidated_frame_inds = inference_state["consolidated_frame_inds"]
+        obj_ids = inference_state["obj_ids"]
+        num_frames = inference_state["num_frames"]
+        batch_size = self._get_obj_num(inference_state)
+        if len(output_dict["cond_frame_outputs"]) == 0:
+            raise RuntimeError("No points are provided; please add points first")
+
+        # set start index, end index, and processing order
+        if start_frame_idx is None:
+            # default: start from the earliest frame with input points
+            start_frame_idx = min(output_dict["cond_frame_outputs"])
+        if max_frame_num_to_track is None:
+            # default: track all the frames in the video
+            max_frame_num_to_track = num_frames
+        if reverse:
+            end_frame_idx = max(start_frame_idx - max_frame_num_to_track, 0)
+            if start_frame_idx > 0:
+                processing_order = range(start_frame_idx, end_frame_idx - 1, -1)
+            else:
+                processing_order = []  # skip reverse tracking if starting from frame 0
+        else:
+            end_frame_idx = min(
+                start_frame_idx + max_frame_num_to_track, num_frames - 1
+            )
+            processing_order = range(start_frame_idx, end_frame_idx + 1)
+
+        print("starting idx", start_frame_idx, "with processing order", processing_order)
+
+        for frame_idx in tqdm(processing_order, desc="propagate in video"):
+            storage_key = "non_cond_frame_outputs"
+            current_out, pred_masks = self._run_single_frame_inference(
+                inference_state=inference_state,
+                output_dict=output_dict,
+                frame_idx=frame_idx,
+                batch_size=batch_size,
+                is_init_cond_frame=False,
+                point_inputs=None,
+                mask_inputs=None,
+                reverse=reverse,
+                run_mem_encoder=True,
+            )
+            output_dict[storage_key][frame_idx] = current_out
             # Create slices of per-object outputs for subsequent interaction with each
             # individual object after tracking.
             self._add_output_per_object(
