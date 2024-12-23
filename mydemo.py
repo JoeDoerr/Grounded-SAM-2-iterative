@@ -13,7 +13,7 @@ from utils.video_utils import create_video_from_images
 import io
 from sam2.sam2_video_predictor import _load_img_bytes_as_tensor, load_single_image
 
-def first_step(text, image_inp):
+def first_step(text, image_inp, image_inp_path, video_height, video_width):
     """
     Step 1: Environment settings and model initialization
     """
@@ -58,7 +58,7 @@ def first_step(text, image_inp):
     #frame_names = first_frame_list #first_frame_list is list = [bytes_image]
 
     # init video predictor state
-    inference_state = video_predictor.non_video_path_init_state(image_inp)#video_predictor.init_state(video_path=video_dir) #FIX
+    inference_state = video_predictor.non_video_path_init_state(image_inp, video_height, video_width)#video_predictor.init_state(video_path=video_dir) #FIX
 
     ann_frame_idx = 0  # the frame index we interact with
     ann_obj_id = 1  # give a unique id to each object we interact with (it can be any integers)
@@ -71,7 +71,7 @@ def first_step(text, image_inp):
     # prompt grounding dino to get the box coordinates on specific frame
     #img_path = os.path.join(video_dir, frame_names[ann_frame_idx])
     #image = Image.open(img_path)
-    image = image_inp#Image.open(io.BytesIO(frame_names[0]))
+    image = Image.open(image_inp_path)
 
     # run Grounding DINO on the image
     inputs = processor(images=image, text=text, return_tensors="pt").to(device)
@@ -278,10 +278,10 @@ def main():
         # img_bytes = buffer.getvalue()
         # buffer.close()
         # images.append(img_bytes)
-        image, _, _ = load_single_image(image_path, 1024)
+        image, video_height, video_width = load_single_image(image_path, 1024)
         images.append(image)
 
-    video_predictor, inference_state, masks1, segments1 = first_step("car.", images[0])
+    video_predictor, inference_state, masks1, segments1 = first_step("car.", images[0], "00001.jpg", video_height, video_width)
     print("mask shapes", masks1.shape)
     print("inference state 1", summarize_dict(inference_state))
     video_predictor, inference_state, masks2, segments2 = new_frame(video_predictor, inference_state, images[1])

@@ -160,6 +160,8 @@ class SAM2VideoPredictor(SAM2Base):
     def non_video_path_init_state(
         self,
         images,
+        video_height,
+        video_width,
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
