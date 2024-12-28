@@ -100,6 +100,16 @@ def _load_img_as_tensor(img_path, image_size):
     video_width, video_height = img_pil.size  # the original video size
     return img, video_height, video_width
 
+def _load_img_as_tensor_no_path(img_pil, image_size):
+    #img_pil = Image.open(img_path)
+    img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
+    if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
+        img_np = img_np / 255.0
+    else:
+        raise RuntimeError(f"Unknown image dtype: {img_np.dtype}")
+    img = torch.from_numpy(img_np).permute(2, 0, 1)
+    video_width, video_height = img_pil.size  # the original video size
+    return img, video_height, video_width
 
 class AsyncVideoFrameLoader:
     """

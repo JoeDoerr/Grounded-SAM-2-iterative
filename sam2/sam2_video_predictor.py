@@ -17,7 +17,7 @@ from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video
 from PIL import Image
 import io
 import numpy as np
-from sam2.utils.misc import load_video_frames_from_jpg_images, _load_img_as_tensor
+from sam2.utils.misc import load_video_frames_from_jpg_images, _load_img_as_tensor, _load_img_as_tensor_no_path
 
 def _load_img_bytes_as_tensor(img_data, image_size):
     img_pil = Image.open(io.BytesIO(img_data))
@@ -40,6 +40,42 @@ def _load_img_bytes_as_tensor(img_data, image_size):
     return img, video_height, video_width
 
 def load_single_image(
+    img_pil,
+    image_size,
+    offload_to_cpu=False,
+    img_mean=(0.485, 0.456, 0.406),
+    img_std=(0.229, 0.224, 0.225),
+    compute_device=torch.device("cuda"),
+):
+    """
+    Load and preprocess a single image from a given path.
+
+    The image is resized to image_size x image_size and is loaded to GPU if
+    `offload_to_cpu` is `False` and to CPU if `offload_to_cpu` is `True`.
+    """
+    # Convert mean and std to tensors
+    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+
+    # Load the image as a tensor
+    image, video_height, video_width = _load_img_as_tensor_no_path(img_pil, image_size) #This was the key to properly loading JPEG images I am pretty sure. Or something here. 
+
+    # Move to the appropriate device
+    if not offload_to_cpu:
+        image = image.to(compute_device)
+        img_mean = img_mean.to(compute_device)
+        img_std = img_std.to(compute_device)
+
+    # Normalize the image
+    image -= img_mean
+    image /= img_std
+
+    image = image.unsqueeze(0)
+    print("image shape", image.shape)
+
+    return image, video_height, video_width
+
+def load_single_image_using_path(
     img_path,
     image_size,
     offload_to_cpu=False,
@@ -58,7 +94,7 @@ def load_single_image(
     img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
 
     # Load the image as a tensor
-    image, video_height, video_width = _load_img_as_tensor(img_path, image_size)
+    image, video_height, video_width = _load_img_as_tensor(img_path, image_size) #This was the key to properly loading JPEG images I am pretty sure. Or something here. 
 
     # Move to the appropriate device
     if not offload_to_cpu:
@@ -156,6 +192,7 @@ class SAM2VideoPredictor(SAM2Base):
     So each image in order, load it in and manage it as _load_img_as_tensor. Then save them into the images torch tensor in the right way. Then normalize. 
     """
 
+    #Simply input the image(s) here to the inference state
     @torch.inference_mode()
     def non_video_path_init_state(
         self,
