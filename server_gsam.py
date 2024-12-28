@@ -168,10 +168,18 @@ def new_frame(video_predictor, inference_state, new_frame):
 
 
 import zmq
+import json
 def main():
     context = zmq.Context()
     socket = context.socket(zmq.REP) #REP sends replies when it gets something and is paired with a REQ socket that sends requests
-    socket.bind("tcp://*:8090") #Yuhan self.socket.bind(f"tcp://*:{port}")
+    #socket.bind("tcp://*:8091") #Yuhan self.socket.bind(f"tcp://*:{port}")
+    socket.bind("tcp://0.0.0.0:8091")
+
+    #while True:
+    #    if socket.poll(timeout=500):
+    #        print("socket poll == True")
+
+    #Their code:
     """
     Step 1: Environment settings and model initialization
     """
@@ -200,14 +208,21 @@ def main():
 
     #This results in video_predictor, image_predicotr, processor, grounding_model
 
+    #My code:
     print("Server is ready...")
     first = False
     inference_state = None
     while True:
+        if first == True:
+            print("Waiting for first message to segment")
+        else:
+            print("Waiting for next message to track")
+        message_parts = socket.recv_multipart(flags=0) #Receiving text and image bytes
         #First get the text inp
-        text_data = socket.recv_string() #No need to specify size using zmq
+        text_data = message_parts[0].decode() #No need to specify size using zmq
+        print("string received", text_data)
         #Second get the image inp
-        image_data = socket.recv() #No need to specify size using zmq
+        image_data = message_parts[1] #No need to specify size using zmq
         image_pil = Image.open(io.BytesIO(image_data))
         image_prepared, video_height, video_width = load_single_image(image_pil, 1024)
         print("image loaded")
@@ -217,16 +232,20 @@ def main():
         else:
             masks, inference_state = new_frame(video_predictor, inference_state, image_prepared)
 
+        #masks=masks.cpu().numpy() don't need this as it already is a np array
         mask_bytes = masks.tobytes()
         metadata = {
             "dtype": str(masks.dtype),
             "shape": masks.shape
         }
         
-        #Serialized mask back with its metadata first
-        socket.send_json(metadata)
-        socket.send(mask_bytes) 
+        metadata_json = json.dumps(metadata)
 
+        #Serialized mask back with its metadata first
+        send_message_parts = [metadata_json.encode(), mask_bytes]
+        #socket.send_json(metadata)
+        #socket.send(mask_bytes) 
+        socket.send_multipart(send_message_parts)
 
 #Take the image in, laod it properly and save it into a list of images, pass the images in individually one by one
 def reference():
