@@ -210,7 +210,7 @@ def main():
 
     #My code:
     print("Server is ready...")
-    first = False
+    first = True
     inference_state = None
     while True:
         if first == True:
@@ -227,10 +227,11 @@ def main():
         image_prepared, video_height, video_width = load_single_image(image_pil, 1024)
         print("image loaded")
         #(processor, grounding_model, video_predictor, image_predictor, device, text, raw_image_inp, image_inp, video_height, video_width)
-        if first == False:
+        if first == True:
             masks, inference_state = first_step(processor, grounding_model, video_predictor, image_predictor, device, text_data, image_pil, image_prepared, video_height, video_width)
         else:
             masks, inference_state = new_frame(video_predictor, inference_state, image_prepared)
+        first = False
 
         #masks=masks.cpu().numpy() don't need this as it already is a np array
         mask_bytes = masks.tobytes()
