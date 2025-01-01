@@ -2,8 +2,9 @@ import zmq
 from PIL import Image
 import io
 import numpy as np
-import cv2
+#import cv2
 import json
+import time
 
 def main():
     context = zmq.Context()
@@ -14,6 +15,7 @@ def main():
     print("Client connected")
 
     for o in range(1, 4):
+        t0 = time.time()
         image_path = f"0000{o}.jpg"
 
         #socket.send_string("car.") #Make sure to use send_string
@@ -38,8 +40,9 @@ def main():
         mask_bytes = message_parts[1]
         # Deserialize the mask
         masks = np.frombuffer(mask_bytes, dtype=metadata["dtype"]).reshape(metadata["shape"])
+        print("time took to do entire one image", time.time() - t0)
 
-        #Saving images to verify this worked
+        """#Saving images to verify this worked
         img = cv2.imread(image_path)
         for mask in masks:
             mask = (mask > 0.5).astype(np.uint8)
@@ -51,7 +54,7 @@ def main():
                 print("colored mask shape", colored_mask[:, :, c].shape, "color shape", color[c].shape)
                 colored_mask[:, :, c] = mask * color[c]
             img = cv2.addWeighted(img, 0.9, colored_mask, 0.1, 0)
-        cv2.imwrite(f"outputfromclient0000{o}.jpg", img)
+        cv2.imwrite(f"outputfromclient0000{o}.jpg", img)"""
 
 if __name__ == "__main__":
     main()
