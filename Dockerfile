@@ -20,14 +20,13 @@ RUN apt-get update && apt-get install --no-install-recommends wget ffmpeg=7:* \
 ENV CC=gcc-10
 ENV CXX=g++-10
 
-RUN mkdir -p /home/appuser/Grounded-SAM-2
-COPY . /home/appuser/Grounded-SAM-2/
-
-WORKDIR /home/appuser/Grounded-SAM-2
-
 # Install essential Python packages
 RUN python -m pip install --upgrade pip setuptools wheel numpy \
-    opencv-python transformers supervision pycocotools addict yapf timm
+    opencv-python transformers supervision pycocotools addict yapf timm pyzmq
+
+RUN mkdir -p /home/appuser/Grounded-SAM-2
+COPY . /home/appuser/Grounded-SAM-2/
+WORKDIR /home/appuser/Grounded-SAM-2
 
 # Install segment_anything package in editable mode
 RUN python -m pip install -e .

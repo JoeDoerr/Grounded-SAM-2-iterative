@@ -47,8 +47,8 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
     results = processor.post_process_grounded_object_detection(
         outputs,
         inputs.input_ids,
-        box_threshold=0.25,
-        text_threshold=0.3,
+        box_threshold=0.6,
+        text_threshold=0.6,
         target_sizes=[image.size[::-1]]
     )
 
@@ -56,8 +56,13 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
     image_predictor.set_image(np.array(image.convert("RGB")))
 
     # process the detection results
+    scores = results[0]["scores"].cpu().numpy()
     input_boxes = results[0]["boxes"].cpu().numpy()
     OBJECTS = results[0]["labels"]
+    print("objects", OBJECTS, "scores", scores)
+    if len(input_boxes) == 0:
+        print("target object not detected")
+        return None, None
 
     # prompt SAM 2 image predictor to get the mask for the object
     masks, scores, logits = image_predictor.predict(
@@ -201,7 +206,7 @@ def main():
 
 
     # init grounding dino model from huggingface
-    model_id = "IDEA-Research/grounding-dino-tiny"
+    model_id = "IDEA-Research/grounding-dino-base"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     processor = AutoProcessor.from_pretrained(model_id)
     grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
@@ -231,13 +236,20 @@ def main():
             masks, inference_state = first_step(processor, grounding_model, video_predictor, image_predictor, device, text_data, image_pil, image_prepared, video_height, video_width)
         else:
             masks, inference_state = new_frame(video_predictor, inference_state, image_prepared)
-        first = False
 
         #masks=masks.cpu().numpy() don't need this as it already is a np array
-        mask_bytes = masks.tobytes()
+        if masks is None:
+            mask_bytes = b'\x00'
+            dtype = None
+            shape = [0]
+        else:
+            first = False
+            mask_bytes = masks.tobytes()
+            dtype = str(masks.dtype)
+            shape = masks.shape
         metadata = {
-            "dtype": str(masks.dtype),
-            "shape": masks.shape
+            "dtype": dtype,
+            "shape": shape
         }
         
         metadata_json = json.dumps(metadata)
