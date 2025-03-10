@@ -148,6 +148,9 @@ def update_inference_state(inference_state, frame, video_predictor):
     print("image shapes", inference_state["images"].shape, frame.shape)
     inference_state["images"] = torch.cat((inference_state["images"], frame), dim=0)
     inference_state["num_frames"] += 1
+    if inference_state["num_frames"] > 5:
+        inference_state["images"] = inference_state["images"][1:]
+        inference_state["num_frames"] -= 1
     return inference_state
 
 #Update the inference state then run propagate in video now without the preflight in a custom function "propagate in video after start"
@@ -217,6 +220,7 @@ def main():
     print("Server is ready...")
     first = True
     inference_state = None
+    target_text = None
     while True:
         if first == True:
             print("Waiting for first message to segment")
@@ -232,10 +236,16 @@ def main():
         image_prepared, video_height, video_width = load_single_image(image_pil, 1024)
         print("image loaded")
         #(processor, grounding_model, video_predictor, image_predictor, device, text, raw_image_inp, image_inp, video_height, video_width)
-        if first == True:
-            masks, inference_state = first_step(processor, grounding_model, video_predictor, image_predictor, device, text_data, image_pil, image_prepared, video_height, video_width)
+        if text_data:
+            target_text = text_data
+            inference_state = None
+        if inference_state is None and target_text is not None:
+            masks, inference_state = first_step(processor, grounding_model, video_predictor, image_predictor, device, target_text, image_pil, image_prepared, video_height, video_width)
         else:
-            masks, inference_state = new_frame(video_predictor, inference_state, image_prepared)
+            if not first:
+                masks, inference_state = new_frame(video_predictor, inference_state, image_prepared)
+            else:
+                masks = None
 
         #masks=masks.cpu().numpy() don't need this as it already is a np array
         if masks is None:
