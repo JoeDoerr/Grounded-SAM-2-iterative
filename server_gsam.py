@@ -218,34 +218,28 @@ def main():
 
     #My code:
     print("Server is ready...")
-    first = True
     inference_state = None
     target_text = None
     while True:
-        if first == True:
-            print("Waiting for first message to segment")
-        else:
-            print("Waiting for next message to track")
+        print("Waiting for message")
         message_parts = socket.recv_multipart(flags=0) #Receiving text and image bytes
-        #First get the text inp
         text_data = message_parts[0].decode() #No need to specify size using zmq
         print("string received", text_data)
         #Second get the image inp
         image_data = message_parts[1] #No need to specify size using zmq
+        ground = message_parts[2] == True.to_bytes(length=1, byteorder='big')
         image_pil = Image.open(io.BytesIO(image_data))
         image_prepared, video_height, video_width = load_single_image(image_pil, 1024)
         print("image loaded")
         #(processor, grounding_model, video_predictor, image_predictor, device, text, raw_image_inp, image_inp, video_height, video_width)
         if text_data:
             target_text = text_data
-            inference_state = None
-        if inference_state is None and target_text is not None:
+        if ground or (inference_state is None and target_text is not None):
             masks, inference_state = first_step(processor, grounding_model, video_predictor, image_predictor, device, target_text, image_pil, image_prepared, video_height, video_width)
         else:
-            if not first:
+            masks = None
+            if inference_state is not None:
                 masks, inference_state = new_frame(video_predictor, inference_state, image_prepared)
-            else:
-                masks = None
 
         #masks=masks.cpu().numpy() don't need this as it already is a np array
         if masks is None:
@@ -253,7 +247,6 @@ def main():
             dtype = None
             shape = [0]
         else:
-            first = False
             mask_bytes = masks.tobytes()
             dtype = str(masks.dtype)
             shape = masks.shape
