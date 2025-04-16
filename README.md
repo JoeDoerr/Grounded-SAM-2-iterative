@@ -1,5 +1,14 @@
 # Grounded SAM 2: Ground and Track Anything in Videos
 
+GSAM service:
+Get a docker container of the required downloads. Talk to this through zmq sockets. Input the text with image through zmq. Then load the image to get it into the correct format. Then input the text and image into the model and receive the masks. 
+
+This can tested using the client_gsam.py inside of the container. You have to give the image path the right image you want to test then you can save the images and view them to see what it looks like. 
+
+You actually need to run it once in the docker container after running the huggingface_downloads.py and commit it from there. 
+
+You should code from the main file then whenever you want to update the docker image use copy.sh dockerid. Then you can get the visuals of the results from the images outside of docker. 
+
 **[IDEA-Research](https://github.com/idea-research)**
 
 [Tianhe Ren](https://rentainhe.github.io/), [Shuo Shen](https://github.com/ShuoShenDe)

@@ -54,12 +54,11 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
 
     # prompt SAM image predictor to get the mask for the object
     image_predictor.set_image(np.array(image.convert("RGB")))
-
     # process the detection results
     scores = results[0]["scores"].cpu().numpy()
     input_boxes = results[0]["boxes"].cpu().numpy()
     OBJECTS = results[0]["labels"]
-    print("objects", OBJECTS, "scores", scores)
+    print("objects", OBJECTS, "scores", scores, "num_boxes", len(input_boxes))
     if len(input_boxes) == 0:
         print("target object not detected")
         return None, None
@@ -235,10 +234,12 @@ def main():
         if text_data:
             target_text = text_data
         if ground or (inference_state is None and target_text is not None):
+            print("first step")
             masks, inference_state = first_step(processor, grounding_model, video_predictor, image_predictor, device, target_text, image_pil, image_prepared, video_height, video_width)
         else:
             masks = None
             if inference_state is not None:
+                print("another frame")
                 masks, inference_state = new_frame(video_predictor, inference_state, image_prepared)
 
         #masks=masks.cpu().numpy() don't need this as it already is a np array
