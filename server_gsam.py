@@ -12,11 +12,44 @@ from utils.video_utils import create_video_from_images
 
 import io
 from sam2.sam2_video_predictor import _load_img_bytes_as_tensor, load_single_image
+from torchvision.ops import nms
 
 """
 For the first step we are running GroundingDINO on the first frame and setting the inference frame up.
 This means we need the processor, grounding_model, video_predictor, text prompt, the input image (to be prepared)
 """
+def apply_nms(boxes, scores, iou_threshold=0.7):
+    keep_indices = nms(boxes, scores, iou_threshold)
+    return boxes[keep_indices], scores[keep_indices], keep_indices
+
+
+def compute_area(box):
+    x0, y0, x1, y1 = box
+    return max(0, x1 - x0) * max(0, y1 - y0)
+
+def intersection_area(boxA, boxB):
+    x0 = max(boxA[0], boxB[0])
+    y0 = max(boxA[1], boxB[1])
+    x1 = min(boxA[2], boxB[2])
+    y1 = min(boxA[3], boxB[3])
+    return max(0, x1 - x0) * max(0, y1 - y0)
+
+def filter_boxes(boxes, threshold=0.9, max_inside=3):
+    keep = []
+    for i, A in enumerate(boxes):
+        count = 0
+        area_A = compute_area(A)
+        for j, B in enumerate(boxes):
+            if i == j:
+                continue
+            area_B = compute_area(B)
+            inter = intersection_area(A, B)
+            if inter / area_B >= threshold:
+                count += 1
+        if count <= max_inside:
+            keep.append(A)
+    return np.array(keep)
+
 def first_step(processor, grounding_model, video_predictor, image_predictor, device, text, raw_image_inp, image_inp, video_height, video_width):
 
     # setup the input image and text prompt for SAM 2 and Grounding DINO
@@ -47,8 +80,8 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
     results = processor.post_process_grounded_object_detection(
         outputs,
         inputs.input_ids,
-        box_threshold=0.5,
-        text_threshold=0.5,
+        box_threshold=0.2,
+        text_threshold=0.7,
         target_sizes=[image.size[::-1]]
     )
 
@@ -62,6 +95,11 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
     if len(input_boxes) == 0:
         print("target object not detected")
         return None, None
+    #non_overlapping_boxes, scores_torch, _ = apply_nms(results[0]["boxes"], results[0]["scores"])
+    #scores = scores_torch.cpu().numpy()
+    #input_boxes = non_overlapping_boxes.cpu().numpy()
+    input_boxes = filter_boxes(input_boxes)
+    print("after overlap filter boxes", len(input_boxes))
 
     # prompt SAM 2 image predictor to get the mask for the object
     masks, scores, logits = image_predictor.predict(
@@ -139,7 +177,7 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
         masks = np.concatenate(masks, axis=0)
 
         #There is only one value in the loop so return here
-        return masks, inference_state
+        return masks, inference_state, input_boxes
 
 #Just concatenate the frame to the batch dimension of the inference state and increment the number of frames
 def update_inference_state(inference_state, frame, video_predictor):
@@ -219,6 +257,7 @@ def main():
     print("Server is ready...")
     inference_state = None
     target_text = None
+    input_boxes = None
     while True:
         print("Waiting for message")
         message_parts = socket.recv_multipart(flags=0) #Receiving text and image bytes
@@ -235,7 +274,7 @@ def main():
             target_text = text_data
         if ground or (inference_state is None and target_text is not None):
             print("first step")
-            masks, inference_state = first_step(processor, grounding_model, video_predictor, image_predictor, device, target_text, image_pil, image_prepared, video_height, video_width)
+            masks, inference_state, input_boxes = first_step(processor, grounding_model, video_predictor, image_predictor, device, target_text, image_pil, image_prepared, video_height, video_width)
         else:
             masks = None
             if inference_state is not None:
@@ -258,8 +297,17 @@ def main():
         
         metadata_json = json.dumps(metadata)
 
+        input_boxes_bytes = input_boxes.tobytes()
+        input_boxes_dtype = str(input_boxes.dtype)
+        input_boxes_shape = input_boxes.shape
+        metadata_input_boxes = {
+            "dtype": input_boxes_dtype,
+            "shape": input_boxes_shape
+        }
+        json_input_boxes = json.dumps(metadata_input_boxes)
+
         #Serialized mask back with its metadata first
-        send_message_parts = [metadata_json.encode(), mask_bytes]
+        send_message_parts = [metadata_json.encode(), mask_bytes, json_input_boxes.encode(), input_boxes_bytes]
         #socket.send_json(metadata)
         #socket.send(mask_bytes) 
         socket.send_multipart(send_message_parts)
