@@ -307,7 +307,7 @@ def main():
         json_input_boxes = json.dumps(metadata_input_boxes)
 
         #Serialized mask back with its metadata first
-        send_message_parts = [metadata_json.encode(), mask_bytes, json_input_boxes.encode(), input_boxes_bytes]
+        send_message_parts = [metadata_json.encode(), mask_bytes]#, json_input_boxes.encode(), input_boxes_bytes]
         #socket.send_json(metadata)
         #socket.send(mask_bytes) 
         socket.send_multipart(send_message_parts)
