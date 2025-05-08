@@ -89,6 +89,7 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
     image_predictor.set_image(np.array(image.convert("RGB")))
     # process the detection results
     scores = results[0]["scores"].cpu().numpy()
+    max_index = np.argmax(scores) #scores.index(max(scores))
     input_boxes = results[0]["boxes"].cpu().numpy()
     OBJECTS = results[0]["labels"]
     print("objects", OBJECTS, "scores", scores, "num_boxes", len(input_boxes))
@@ -177,7 +178,7 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
         masks = np.concatenate(masks, axis=0)
 
         #There is only one value in the loop so return here
-        return masks, inference_state, input_boxes
+        return masks, inference_state, input_boxes, max_index
 
 #Just concatenate the frame to the batch dimension of the inference state and increment the number of frames
 def update_inference_state(inference_state, frame, video_predictor):
@@ -258,6 +259,7 @@ def main():
     inference_state = None
     target_text = None
     input_boxes = None
+    max_index = None
     while True:
         print("Waiting for message")
         message_parts = socket.recv_multipart(flags=0) #Receiving text and image bytes
@@ -274,7 +276,7 @@ def main():
             target_text = text_data
         if ground or (inference_state is None and target_text is not None):
             print("first step")
-            masks, inference_state, input_boxes = first_step(processor, grounding_model, video_predictor, image_predictor, device, target_text, image_pil, image_prepared, video_height, video_width)
+            masks, inference_state, input_boxes, max_index = first_step(processor, grounding_model, video_predictor, image_predictor, device, target_text, image_pil, image_prepared, video_height, video_width)
         else:
             masks = None
             if inference_state is not None:
@@ -307,7 +309,7 @@ def main():
         json_input_boxes = json.dumps(metadata_input_boxes)
 
         #Serialized mask back with its metadata first
-        send_message_parts = [metadata_json.encode(), mask_bytes]#, json_input_boxes.encode(), input_boxes_bytes]
+        send_message_parts = [metadata_json.encode(), mask_bytes, str(max_index).encode('utf-8')]#, json_input_boxes.encode(), input_boxes_bytes]
         #socket.send_json(metadata)
         #socket.send(mask_bytes) 
         socket.send_multipart(send_message_parts)
