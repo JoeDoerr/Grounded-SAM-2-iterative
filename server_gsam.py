@@ -89,13 +89,13 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
     image_predictor.set_image(np.array(image.convert("RGB")))
     # process the detection results
     scores = results[0]["scores"].cpu().numpy()
-    max_index = np.argmax(scores) #scores.index(max(scores))
     input_boxes = results[0]["boxes"].cpu().numpy()
     OBJECTS = results[0]["labels"]
     print("objects", OBJECTS, "scores", scores, "num_boxes", len(input_boxes))
     if len(input_boxes) == 0:
         print("target object not detected")
-        return None, None
+        return None, None, None, None
+    max_index = np.argmax(scores) #scores.index(max(scores))
     #non_overlapping_boxes, scores_torch, _ = apply_nms(results[0]["boxes"], results[0]["scores"])
     #scores = scores_torch.cpu().numpy()
     #input_boxes = non_overlapping_boxes.cpu().numpy()
@@ -219,7 +219,8 @@ def main():
     context = zmq.Context()
     socket = context.socket(zmq.REP) #REP sends replies when it gets something and is paired with a REQ socket that sends requests
     #socket.bind("tcp://*:8091") #Yuhan self.socket.bind(f"tcp://*:{port}")
-    socket.bind("tcp://0.0.0.0:8091")
+    # socket.bind("tcp://0.0.0.0:8091")
+    socket.bind("tcp://0.0.0.0:9080")
 
     #while True:
     #    if socket.poll(timeout=500):
@@ -299,14 +300,14 @@ def main():
         
         metadata_json = json.dumps(metadata)
 
-        input_boxes_bytes = input_boxes.tobytes()
-        input_boxes_dtype = str(input_boxes.dtype)
-        input_boxes_shape = input_boxes.shape
-        metadata_input_boxes = {
-            "dtype": input_boxes_dtype,
-            "shape": input_boxes_shape
-        }
-        json_input_boxes = json.dumps(metadata_input_boxes)
+        # input_boxes_bytes = input_boxes.tobytes()
+        # input_boxes_dtype = str(input_boxes.dtype)
+        # input_boxes_shape = input_boxes.shape
+        # metadata_input_boxes = {
+        #     "dtype": input_boxes_dtype,
+        #     "shape": input_boxes_shape
+        # }
+        # json_input_boxes = json.dumps(metadata_input_boxes)
 
         #Serialized mask back with its metadata first
         send_message_parts = [metadata_json.encode(), mask_bytes, str(max_index).encode('utf-8')]#, json_input_boxes.encode(), input_boxes_bytes]
