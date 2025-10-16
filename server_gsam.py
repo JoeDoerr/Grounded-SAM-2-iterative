@@ -6,7 +6,8 @@ import supervision as sv
 from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection 
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, AutoModelForCausalLM
+from sentence_transformers import SentenceTransformer
 from utils.track_utils import sample_points_from_masks
 from utils.video_utils import create_video_from_images
 
@@ -18,6 +19,35 @@ from torchvision.ops import nms
 For the first step we are running GroundingDINO on the first frame and setting the inference frame up.
 This means we need the processor, grounding_model, video_predictor, text prompt, the input image (to be prepared)
 """
+
+def run_florence2(task_prompt, text_input, model, processor, image):
+    assert model is not None, "You should pass the init florence-2 model here"
+    assert processor is not None, "You should set florence-2 processor here"
+
+    device = model.device
+
+    if text_input is None:
+        prompt = task_prompt
+    else:
+        prompt = task_prompt + text_input
+    
+    inputs = processor(text=prompt, images=image, return_tensors="pt").to(device, torch.float16)
+    generated_ids = model.generate(
+      input_ids=inputs["input_ids"].to(device),
+      pixel_values=inputs["pixel_values"].to(device),
+      max_new_tokens=1024,
+      early_stopping=False,
+      do_sample=False,
+      num_beams=3,
+    )
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    parsed_answer = processor.post_process_generation(
+        generated_text, 
+        task=task_prompt, 
+        image_size=(image.width, image.height)
+    )
+    return parsed_answer
+
 def apply_nms(boxes, scores, iou_threshold=0.7):
     keep_indices = nms(boxes, scores, iou_threshold)
     return boxes[keep_indices], scores[keep_indices], keep_indices
@@ -50,7 +80,7 @@ def filter_boxes(boxes, threshold=0.9, max_inside=3):
             keep.append(A)
     return np.array(keep)
 
-def first_step(processor, grounding_model, video_predictor, image_predictor, device, text, raw_image_inp, image_inp, video_height, video_width):
+def first_step(processor, grounding_model, video_predictor, image_predictor, florence2_model, florence2_processor, sentence_model, device, text, raw_image_inp, image_inp, video_height, video_width):
 
     # setup the input image and text prompt for SAM 2 and Grounding DINO
     # VERY important: text queries need to be lowercased + end with a dot
@@ -72,35 +102,80 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
     #image = Image.open(image_inp_path)
     image = raw_image_inp
 
-    # run Grounding DINO on the image
-    inputs = processor(images=image, text=text, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = grounding_model(**inputs)
+    if text == "Object.":
+        # run Grounding DINO on the image
+        inputs = processor(images=image, text=text, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = grounding_model(**inputs)
 
-    results = processor.post_process_grounded_object_detection(
-        outputs,
-        inputs.input_ids,
-        box_threshold=0.2,
-        text_threshold=0.7,
-        target_sizes=[image.size[::-1]]
-    )
+        results = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            box_threshold=0.2,
+            text_threshold=0.7,
+            target_sizes=[image.size[::-1]]
+        )
 
-    # prompt SAM image predictor to get the mask for the object
-    image_predictor.set_image(np.array(image.convert("RGB")))
-    # process the detection results
-    scores = results[0]["scores"].cpu().numpy()
-    input_boxes = results[0]["boxes"].cpu().numpy()
-    OBJECTS = results[0]["labels"]
+        # process the detection results
+        scores = results[0]["scores"].cpu().numpy()
+        input_boxes = results[0]["boxes"].cpu().numpy()
+        OBJECTS = results[0]["labels"]
+    else:
+        # run florence-2 object detection in demo
+        # task_prompt="<REFERRING_EXPRESSION_SEGMENTATION>"
+        # task_prompt="<OPEN_VOCABULARY_DETECTION>"
+        # task_prompt="<DENSE_REGION_CAPTION>"
+        # task_prompt="<OD>"
+        task_prompt="<CAPTION_TO_PHRASE_GROUNDING>"
+        input_text = "A scene with many household objects, one of which is a " + text
+        results = run_florence2(task_prompt, input_text, florence2_model, florence2_processor, image)
+        results = results[task_prompt]
+        print(results)
+        # parse florence-2 detection results
+        # polygon_points = np.array(results["polygons"][0], dtype=np.int32).reshape(-1, 2)
+        
+        # # parse polygon format to mask
+        # img_width, img_height = image.size[0], image.size[1]
+        # florence2_mask = np.zeros((img_height, img_width), dtype=np.uint8)
+        # if len(polygon_points) < 3:
+        #     print("Invalid polygon:", polygon_points)
+        #     exit()
+        # cv2.fillPoly(florence2_mask, [polygon_points], 1)
+        # if florence2_mask.ndim == 2:
+        #     florence2_mask = florence2_mask[None]
+
+        # # compute bounding box based on polygon points
+        # x_min = np.min(polygon_points[:, 0])
+        # y_min = np.min(polygon_points[:, 1])
+        # x_max = np.max(polygon_points[:, 0])
+        # y_max = np.max(polygon_points[:, 1])
+        # input_boxes = np.array([[x_min, y_min, x_max, y_max]])
+        # OBJECTS = [text]
+        # scores = [1.0]
+
+        input_boxes = np.array(results["bboxes"])
+        OBJECTS = np.array(results["labels"])
+        embed_labels = sentence_model.encode(OBJECTS)
+        embed_target = sentence_model.encode(text)
+        scores = sentence_model.similarity(embed_target, embed_labels)
+        scores = scores[0].cpu().numpy()
+
     print("objects", OBJECTS, "scores", scores, "num_boxes", len(input_boxes))
+
     if len(input_boxes) == 0:
         print("target object not detected")
         return None, None, None, None
-    max_index = np.argmax(scores) #scores.index(max(scores))
+    max_index = -1
+    if np.max(scores) >= 0.6:
+        max_index = np.argmax(scores) #scores.index(max(scores))
     #non_overlapping_boxes, scores_torch, _ = apply_nms(results[0]["boxes"], results[0]["scores"])
     #scores = scores_torch.cpu().numpy()
     #input_boxes = non_overlapping_boxes.cpu().numpy()
     input_boxes = filter_boxes(input_boxes)
     print("after overlap filter boxes", len(input_boxes))
+
+    # prompt SAM image predictor to get the mask for the object
+    image_predictor.set_image(np.array(image.convert("RGB")))
 
     # prompt SAM 2 image predictor to get the mask for the object
     masks, scores, logits = image_predictor.predict(
@@ -232,6 +307,7 @@ def main():
     """
     # use bfloat16 for the entire notebook
     torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if torch.cuda.get_device_properties(0).major >= 8:
         # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
@@ -239,9 +315,13 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
 
     # init sam image predictor and video predictor model
+    VLM_MODEL_ID = "microsoft/Florence-2-large"
+    # VLM_MODEL_ID = "google/paligemma-3b-ft-refcoco-seg-896"
     sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
     model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
+    florence2_model = AutoModelForCausalLM.from_pretrained(VLM_MODEL_ID, trust_remote_code=True, torch_dtype='auto').eval().to(device)
+    florence2_processor = AutoProcessor.from_pretrained(VLM_MODEL_ID, trust_remote_code=True)
     video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
     sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
     image_predictor = SAM2ImagePredictor(sam2_image_model)
@@ -249,9 +329,10 @@ def main():
 
     # init grounding dino model from huggingface
     model_id = "IDEA-Research/grounding-dino-base"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     processor = AutoProcessor.from_pretrained(model_id)
     grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
+    sentence_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
 
     #This results in video_predictor, image_predicotr, processor, grounding_model
 
@@ -277,7 +358,7 @@ def main():
             target_text = text_data
         if ground or (inference_state is None and target_text is not None):
             print("first step")
-            masks, inference_state, input_boxes, max_index = first_step(processor, grounding_model, video_predictor, image_predictor, device, target_text, image_pil, image_prepared, video_height, video_width)
+            masks, inference_state, input_boxes, max_index = first_step(processor, grounding_model, video_predictor, image_predictor, florence2_model, florence2_processor, sentence_model, device, target_text, image_pil, image_prepared, video_height, video_width)
         else:
             masks = None
             if inference_state is not None:
