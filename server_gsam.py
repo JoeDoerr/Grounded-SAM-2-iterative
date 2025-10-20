@@ -126,11 +126,25 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, flo
         # task_prompt="<OPEN_VOCABULARY_DETECTION>"
         # task_prompt="<DENSE_REGION_CAPTION>"
         # task_prompt="<OD>"
-        task_prompt="<CAPTION_TO_PHRASE_GROUNDING>"
-        input_text = "A scene with many household objects, one of which is a " + text
-        results = run_florence2(task_prompt, input_text, florence2_model, florence2_processor, image)
-        results = results[task_prompt]
+        # task_prompt="<CAPTION_TO_PHRASE_GROUNDING>"
+        # task_prompt="<REGION_TO_DESCRIPTION>"
+        input_text = "A scene with many objects, one of which is " + text
+        # input_text = ''
+        # results = run_florence2(task_prompt, input_text, florence2_model, florence2_processor, image)
+        # results = results[task_prompt]
+        # print(results)
+
+        # image caption
+        # caption_results = run_florence2("<MORE_DETAILED_CAPTION>", None, florence2_model, florence2_processor, image)
+        # input_text = caption_results["<MORE_DETAILED_CAPTION>"]
+        # input_text += "Also on the table is " + text
+        print('Image caption:', input_text)
+        
+        # phrase grounding
+        grounding_results = run_florence2('<CAPTION_TO_PHRASE_GROUNDING>', input_text, florence2_model, florence2_processor, image)
+        results = grounding_results['<CAPTION_TO_PHRASE_GROUNDING>']
         print(results)
+
         # parse florence-2 detection results
         # polygon_points = np.array(results["polygons"][0], dtype=np.int32).reshape(-1, 2)
         
@@ -166,13 +180,18 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, flo
         print("target object not detected")
         return None, None, None, None
     max_index = -1
-    if np.max(scores) >= 0.6:
+    if np.max(scores) >= 0.7:
         max_index = np.argmax(scores) #scores.index(max(scores))
+    print("max_index: ", max_index, scores[max_index])
     #non_overlapping_boxes, scores_torch, _ = apply_nms(results[0]["boxes"], results[0]["scores"])
     #scores = scores_torch.cpu().numpy()
     #input_boxes = non_overlapping_boxes.cpu().numpy()
-    input_boxes = filter_boxes(input_boxes)
-    print("after overlap filter boxes", len(input_boxes))
+    # len0 = len(input_boxes)
+    # input_boxes = filter_boxes(input_boxes)
+    # len1 = len(input_boxes)
+    # print("after overlap filter boxes", len1)
+    # if max_index > len1:
+    #     max_index -= len0-len1
 
     # prompt SAM image predictor to get the mask for the object
     image_predictor.set_image(np.array(image.convert("RGB")))
