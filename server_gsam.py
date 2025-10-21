@@ -96,6 +96,8 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
         print("target object not detected")
         return None, None, None, None
     max_index = np.argmax(scores) #scores.index(max(scores))
+    if scores[max_index] < 0.7:
+        max_index = -1
     #non_overlapping_boxes, scores_torch, _ = apply_nms(results[0]["boxes"], results[0]["scores"])
     #scores = scores_torch.cpu().numpy()
     #input_boxes = non_overlapping_boxes.cpu().numpy()
