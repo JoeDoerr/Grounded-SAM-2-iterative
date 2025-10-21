@@ -120,6 +120,8 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, flo
         scores = results[0]["scores"].cpu().numpy()
         input_boxes = results[0]["boxes"].cpu().numpy()
         OBJECTS = results[0]["labels"]
+
+        input_boxes = filter_boxes(input_boxes)
     else:
         # run florence-2 object detection in demo
         # task_prompt="<REFERRING_EXPRESSION_SEGMENTATION>"
@@ -128,15 +130,15 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, flo
         # task_prompt="<OD>"
         # task_prompt="<CAPTION_TO_PHRASE_GROUNDING>"
         # task_prompt="<REGION_TO_DESCRIPTION>"
-        input_text = "A scene with many objects, one of which is " + text
+        # input_text = "A scene with many objects, one of which is " + text
         # input_text = ''
         # results = run_florence2(task_prompt, input_text, florence2_model, florence2_processor, image)
         # results = results[task_prompt]
         # print(results)
 
         # image caption
-        # caption_results = run_florence2("<MORE_DETAILED_CAPTION>", None, florence2_model, florence2_processor, image)
-        # input_text = caption_results["<MORE_DETAILED_CAPTION>"]
+        caption_results = run_florence2("<MORE_DETAILED_CAPTION>", None, florence2_model, florence2_processor, image)
+        input_text = caption_results["<MORE_DETAILED_CAPTION>"]
         # input_text += "Also on the table is " + text
         print('Image caption:', input_text)
         
