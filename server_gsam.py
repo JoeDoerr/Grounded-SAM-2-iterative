@@ -1,31 +1,25 @@
-import os
+import io
+import json
+from typing import Optional
+
 import cv2
 import torch
 import numpy as np
-import supervision as sv
 from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection 
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 from utils.track_utils import sample_points_from_masks
-from utils.video_utils import create_video_from_images
 
-import io
-from sam2.sam2_video_predictor import _load_img_bytes_as_tensor, load_single_image
-from torchvision.ops import nms
+from sam2.sam2_video_predictor import load_single_image
 
-"""
-For the first step we are running GroundingDINO on the first frame and setting the inference frame up.
-This means we need the processor, grounding_model, video_predictor, text prompt, the input image (to be prepared)
-"""
-def apply_nms(boxes, scores, iou_threshold=0.7):
-    keep_indices = nms(boxes, scores, iou_threshold)
-    return boxes[keep_indices], scores[keep_indices], keep_indices
+import zmq
 
 
 def compute_area(box):
     x0, y0, x1, y1 = box
     return max(0, x1 - x0) * max(0, y1 - y0)
+
 
 def intersection_area(boxA, boxB):
     x0 = max(boxA[0], boxB[0])
@@ -33,6 +27,7 @@ def intersection_area(boxA, boxB):
     x1 = min(boxA[2], boxB[2])
     y1 = min(boxA[3], boxB[3])
     return max(0, x1 - x0) * max(0, y1 - y0)
+
 
 def filter_boxes(boxes, threshold=0.9, max_inside=3):
     keep = []
@@ -48,31 +43,55 @@ def filter_boxes(boxes, threshold=0.9, max_inside=3):
                 count += 1
         if count <= max_inside:
             keep.append(A)
-    return np.array(keep)
-
-def first_step(processor, grounding_model, video_predictor, image_predictor, device, text, raw_image_inp, image_inp, video_height, video_width):
-
-    # setup the input image and text prompt for SAM 2 and Grounding DINO
-    # VERY important: text queries need to be lowercased + end with a dot
-    #text = "car."
-
-    # init video predictor state
-    inference_state = video_predictor.non_video_path_init_state(image_inp, video_height, video_width)
-
-    ann_frame_idx = 0  # the frame index we interact with
+    return np.array(keep) if keep else np.zeros((0, 4), dtype=np.float32)
 
 
+def _default_server_params():
+    return {
+        "box_threshold": 0.2,
+        "text_threshold": 0.25,
+        "min_best_score": 0.35,
+        "box_overlap_filter_threshold": 0.9,
+        "max_inside": 3,
+        "max_frames_in_state": 5,
+        "nms_iou_threshold": 0.7,
+    }
+
+
+def merge_gsam_params(base: dict, override: Optional[dict]) -> dict:
+    out = dict(base)
+    if override:
+        out.update(override)
+    return out
+
+
+def first_step(
+    processor,
+    grounding_model,
+    video_predictor,
+    image_predictor,
+    device,
+    text,
+    raw_image_inp,
+    image_inp,
+    video_height,
+    video_width,
+    p: dict,
+):
     """
-    Step 2: Prompt Grounding DINO and SAM image predictor to get the box and mask for specific frame
+    GroundingDINO + SAM2 image + video init for one target (best-scoring box only).
+    p keys: box_threshold, text_threshold, min_best_score, box_overlap_filter_threshold,
+    max_inside, nms_iou_threshold (optional; NMS not applied on single best box path).
+    Returns (mask_hw, inference_state, meta). mask_hw is bool (H,W) or None on failure.
     """
+    meta = {"ok": False, "reason": "unknown", "best_score": None, "params_used": dict(p)}
 
-    # prompt grounding dino to get the box coordinates on specific frame
-    #img_path = os.path.join(video_dir, frame_names[ann_frame_idx])
-    #image = Image.open(img_path)
-    #image = Image.open(image_inp_path)
+    inference_state = video_predictor.non_video_path_init_state(
+        image_inp, video_height, video_width
+    )
+    ann_frame_idx = 0
     image = raw_image_inp
 
-    # run Grounding DINO on the image
     inputs = processor(images=image, text=text, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = grounding_model(**inputs)
@@ -80,167 +99,355 @@ def first_step(processor, grounding_model, video_predictor, image_predictor, dev
     results = processor.post_process_grounded_object_detection(
         outputs,
         inputs.input_ids,
-        box_threshold=0.2,
-        text_threshold=0.7,
-        target_sizes=[image.size[::-1]]
+        box_threshold=float(p["box_threshold"]),
+        text_threshold=float(p["text_threshold"]),
+        target_sizes=[image.size[::-1]],
     )
 
-    # prompt SAM image predictor to get the mask for the object
-    image_predictor.set_image(np.array(image.convert("RGB")))
-    # process the detection results
     scores = results[0]["scores"].cpu().numpy()
     input_boxes = results[0]["boxes"].cpu().numpy()
-    OBJECTS = results[0]["labels"]
-    print("objects", OBJECTS, "scores", scores, "num_boxes", len(input_boxes))
-    if len(input_boxes) == 0:
-        print("target object not detected")
-        return None, None, None, None
-    max_index = np.argmax(scores) #scores.index(max(scores))
-    if scores[max_index] < 0.7:
-        max_index = -1
-    #non_overlapping_boxes, scores_torch, _ = apply_nms(results[0]["boxes"], results[0]["scores"])
-    #scores = scores_torch.cpu().numpy()
-    #input_boxes = non_overlapping_boxes.cpu().numpy()
-    input_boxes = filter_boxes(input_boxes)
-    print("after overlap filter boxes", len(input_boxes))
+    labels = results[0]["labels"]
+    print("objects", labels, "scores", scores, "num_boxes", len(input_boxes))
 
-    # prompt SAM 2 image predictor to get the mask for the object
-    masks, scores, logits = image_predictor.predict(
+    if len(input_boxes) == 0:
+        meta["reason"] = "no_boxes"
+        return None, None, meta
+
+    best_i = int(np.argmax(scores))
+    best_score = float(scores[best_i])
+    meta["best_score"] = best_score
+    if best_score < float(p["min_best_score"]):
+        meta["reason"] = "low_score"
+        return None, None, meta
+
+    input_boxes = input_boxes[best_i : best_i + 1]
+    filtered = filter_boxes(
+        input_boxes,
+        threshold=float(p["box_overlap_filter_threshold"]),
+        max_inside=int(p["max_inside"]),
+    )
+    if filtered.shape[0] == 0:
+        meta["reason"] = "filtered_empty"
+        return None, None, meta
+    input_boxes = filtered[:1]
+
+    label_one = labels[best_i] if hasattr(labels, "__getitem__") else labels
+
+    image_predictor.set_image(np.array(image.convert("RGB")))
+    masks, sam_scores, logits = image_predictor.predict(
         point_coords=None,
         point_labels=None,
         box=input_boxes,
         multimask_output=False,
     )
 
-    # convert the mask shape to (n, H, W)
     if masks.ndim == 3:
         masks = masks[None]
-        scores = scores[None]
-        logits = logits[None]
     elif masks.ndim == 4:
         masks = masks.squeeze(1)
 
-    """
-    Step 3: Register each object's positive points to video predictor with separate add_new_points call
-    """
+    if masks is None or masks.shape[0] == 0:
+        meta["reason"] = "sam_empty"
+        return None, None, meta
 
-    PROMPT_TYPE_FOR_VIDEO = "box" # or "point"
+    PROMPT_TYPE_FOR_VIDEO = "box"
+    assert PROMPT_TYPE_FOR_VIDEO in ["point", "box", "mask"]
 
-    assert PROMPT_TYPE_FOR_VIDEO in ["point", "box", "mask"], "SAM 2 video predictor only support point/box/mask prompt"
-
-    # If you are using point prompts, we uniformly sample positive points based on the mask
     if PROMPT_TYPE_FOR_VIDEO == "point":
-        # sample the positive points from mask for each objects
         all_sample_points = sample_points_from_masks(masks=masks, num_points=10)
-
-        for object_id, (label, points) in enumerate(zip(OBJECTS, all_sample_points), start=1):
-            labels = np.ones((points.shape[0]), dtype=np.int32)
-            _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
+        for object_id, points in enumerate(all_sample_points, start=1):
+            labels_pt = np.ones((points.shape[0]), dtype=np.int32)
+            video_predictor.add_new_points_or_box(
                 inference_state=inference_state,
                 frame_idx=ann_frame_idx,
                 obj_id=object_id,
                 points=points,
-                labels=labels,
+                labels=labels_pt,
             )
-    # Using box prompt
     elif PROMPT_TYPE_FOR_VIDEO == "box":
-        for object_id, (label, box) in enumerate(zip(OBJECTS, input_boxes), start=1):
-            _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
+        for object_id, box in enumerate(input_boxes, start=1):
+            video_predictor.add_new_points_or_box(
                 inference_state=inference_state,
                 frame_idx=ann_frame_idx,
                 obj_id=object_id,
                 box=box,
             )
-    # Using mask prompt is a more straightforward way
     elif PROMPT_TYPE_FOR_VIDEO == "mask":
-        for object_id, (label, mask) in enumerate(zip(OBJECTS, masks), start=1):
-            labels = np.ones((1), dtype=np.int32)
-            _, out_obj_ids, out_mask_logits = video_predictor.add_new_mask(
+        for object_id, mask in enumerate(masks, start=1):
+            video_predictor.add_new_mask(
                 inference_state=inference_state,
                 frame_idx=ann_frame_idx,
                 obj_id=object_id,
-                mask=mask
+                mask=mask,
             )
-    else:
-        raise NotImplementedError("SAM 2 video predictor only support point/box/mask prompts")
 
-
-    """
-    Step 4: Propagate the video predictor to get the segmentation results for each frame
-    """
-    video_segments = {}  # video_segments contains the per-frame segmentation results
-    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
+    video_segments = {}
+    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
+        inference_state
+    ):
         video_segments[out_frame_idx] = {
             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
             for i, out_obj_id in enumerate(out_obj_ids)
         }
 
-    for _, segments in video_segments.items():
-        masks = list(segments.values())
-        masks = np.concatenate(masks, axis=0)
+    if not video_segments:
+        meta["reason"] = "propagate_empty"
+        return None, None, meta
 
-        #There is only one value in the loop so return here
-        return masks, inference_state, input_boxes, max_index
+    _, segments = next(iter(video_segments.items()))
+    mask_list = list(segments.values())
+    if not mask_list:
+        meta["reason"] = "no_masks"
+        return None, None, meta
 
-#Just concatenate the frame to the batch dimension of the inference state and increment the number of frames
-def update_inference_state(inference_state, frame, video_predictor):
-    #inference_state["images"] = process frame correctly and pass it in here, it is img = torch.zeros(batch, 3, image_size, image_size, dtype=torch.float32)
+    stacked = np.concatenate(mask_list, axis=0)
+    mask_hw = np.any(stacked, axis=0).astype(np.bool_)
+    meta["ok"] = True
+    meta["reason"] = "ok"
+    meta["label"] = str(label_one)
+    return mask_hw, inference_state, meta
+
+
+def update_inference_state(inference_state, frame, max_frames: int):
     print("image shapes", inference_state["images"].shape, frame.shape)
     inference_state["images"] = torch.cat((inference_state["images"], frame), dim=0)
     inference_state["num_frames"] += 1
-    if inference_state["num_frames"] > 5:
+    while inference_state["num_frames"] > max_frames:
         inference_state["images"] = inference_state["images"][1:]
         inference_state["num_frames"] -= 1
     return inference_state
 
-#Update the inference state then run propagate in video now without the preflight in a custom function "propagate in video after start"
-def new_frame(video_predictor, inference_state, new_frame):
-    #fix inference state
-    inference_state = update_inference_state(inference_state, new_frame, video_predictor) #video_predictor.update_inference_state(inference_state, new_frame)
-    inference_state_idx = inference_state['num_frames'] - 1 #Only propagate the newest frame
+
+def new_frame(video_predictor, inference_state, new_frame_tensor, max_frames: int):
+    inference_state = update_inference_state(
+        inference_state, new_frame_tensor, max_frames
+    )
+    inference_state_idx = inference_state["num_frames"] - 1
     print("inference_state_idx", inference_state_idx)
 
-    video_segments = {}  # video_segments contains the per-frame segmentation results
-    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video_after_start(inference_state, start_frame_idx=inference_state_idx):
+    video_segments = {}
+    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video_after_start(
+        inference_state, start_frame_idx=inference_state_idx
+    ):
         video_segments[out_frame_idx] = {
             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
             for i, out_obj_id in enumerate(out_obj_ids)
         }
 
-    for _, segments in video_segments.items():
-        masks = list(segments.values())
-        masks = np.concatenate(masks, axis=0)
+    if not video_segments:
+        return None, inference_state
 
-        #There is only one value in the loop so return here
-        return masks, inference_state
+    _, segments = next(iter(video_segments.items()))
+    masks = list(segments.values())
+    if not masks:
+        return None, inference_state
+    stacked = np.concatenate(masks, axis=0)
+    mask_hw = np.any(stacked, axis=0).astype(np.bool_)
+    return mask_hw, inference_state
 
 
-import zmq
-import json
+def run_segment_with_fallback(
+    processor,
+    grounding_model,
+    video_predictor,
+    image_predictor,
+    device,
+    text,
+    image_pil,
+    image_prepared,
+    video_height,
+    video_width,
+    base_params: dict,
+    allow_fallback: bool,
+    fallback_steps: list,
+):
+    """Try segmentation with base_params, then optional relaxed steps."""
+    attempts = [merge_gsam_params(base_params, {})]
+    if allow_fallback and fallback_steps:
+        for step in fallback_steps:
+            attempts.append(merge_gsam_params(attempts[-1], step))
+
+    used_fallback = False
+    last_meta = None
+    for i, p in enumerate(attempts):
+        mask_hw, inference_state, meta = first_step(
+            processor,
+            grounding_model,
+            video_predictor,
+            image_predictor,
+            device,
+            text,
+            image_pil,
+            image_prepared,
+            video_height,
+            video_width,
+            p,
+        )
+        last_meta = meta
+        if meta.get("ok") and mask_hw is not None:
+            if i > 0:
+                used_fallback = True
+                print(
+                    f"GSAM: segmentation succeeded after lowering thresholds (attempt {i + 1}/{len(attempts)}). "
+                    f"params_used={meta.get('params_used')}"
+                )
+            meta["used_fallback"] = used_fallback
+            return mask_hw, inference_state, meta
+        if i < len(attempts) - 1:
+            print(
+                f"GSAM: segmentation failed ({meta.get('reason')}); retrying with looser thresholds. "
+                f"next_params={attempts[i + 1]}"
+            )
+
+    last_meta = last_meta or {"ok": False, "reason": "unknown"}
+    last_meta["ok"] = False
+    last_meta["used_fallback"] = len(attempts) > 1
+    print(
+        f"GSAM: segmentation failed after all attempts. Last reason={last_meta.get('reason')} "
+        f"best_score={last_meta.get('best_score')}"
+    )
+    return None, None, last_meta
+
+
+def _reply(socket, meta: dict, mask_hw: Optional[np.ndarray]):
+    if mask_hw is not None and meta.get("ok"):
+        mask_u8 = (mask_hw.astype(np.uint8) * 255)
+        mask_bytes = mask_u8.tobytes()
+        meta_out = {
+            "ok": True,
+            "reason": meta.get("reason", "ok"),
+            "used_fallback": bool(meta.get("used_fallback", False)),
+            "params_used": meta.get("params_used"),
+            "mask_dtype": str(mask_u8.dtype),
+            "mask_shape": list(mask_u8.shape),
+            "best_score": meta.get("best_score"),
+            "label": meta.get("label"),
+        }
+    else:
+        mask_bytes = b""
+        meta_out = {
+            "ok": False,
+            "reason": meta.get("reason", "error"),
+            "used_fallback": bool(meta.get("used_fallback", False)),
+            "params_used": meta.get("params_used"),
+            "mask_dtype": None,
+            "mask_shape": [],
+            "best_score": meta.get("best_score"),
+            "label": meta.get("label"),
+        }
+    socket.send_multipart([json.dumps(meta_out).encode("utf-8"), mask_bytes])
+
+
+def _handle_legacy_request(
+    socket,
+    message_parts,
+    processor,
+    grounding_model,
+    video_predictor,
+    image_predictor,
+    device,
+    server_defaults: dict,
+    inference_state_holder: list,
+    target_text_holder: list,
+):
+    """
+    Legacy: [text_utf8, jpeg_bytes, one_byte_flag].
+    Flag 0x01 = force new segmentation (old 'do_not_track' True).
+    """
+    text_data = message_parts[0].decode("utf-8")
+    image_data = message_parts[1]
+    force_segment = False
+    if len(message_parts) >= 3:
+        force_segment = message_parts[2] == b"\x01"
+
+    image_pil = Image.open(io.BytesIO(image_data))
+    image_prepared, video_height, video_width = load_single_image(image_pil, 1024)
+
+    if text_data:
+        target_text_holder[0] = text_data
+    text = target_text_holder[0]
+    if text is None:
+        _reply(socket, {"ok": False, "reason": "no_target_text"}, None)
+        return
+
+    max_f = int(server_defaults["max_frames_in_state"])
+    if force_segment or inference_state_holder[0] is None:
+        mask_hw, inf, meta = run_segment_with_fallback(
+            processor,
+            grounding_model,
+            video_predictor,
+            image_predictor,
+            device,
+            text,
+            image_pil,
+            image_prepared,
+            video_height,
+            video_width,
+            server_defaults,
+            allow_fallback=True,
+            fallback_steps=[
+                {
+                    "box_threshold": 0.12,
+                    "text_threshold": 0.18,
+                    "min_best_score": 0.22,
+                },
+                {
+                    "box_threshold": 0.08,
+                    "text_threshold": 0.12,
+                    "min_best_score": 0.12,
+                },
+            ],
+        )
+        if meta.get("ok"):
+            inference_state_holder[0] = inf
+        else:
+            inference_state_holder[0] = None
+        _reply(socket, meta, mask_hw)
+        return
+
+    mask_hw, inf = new_frame(
+        video_predictor,
+        inference_state_holder[0],
+        image_prepared,
+        max_f,
+    )
+    inference_state_holder[0] = inf
+    if mask_hw is None:
+        _reply(
+            socket,
+            {
+                "ok": False,
+                "reason": "tracking_failed",
+                "params_used": server_defaults,
+            },
+            None,
+        )
+        return
+    _reply(
+        socket,
+        {
+            "ok": True,
+            "reason": "ok",
+            "used_fallback": False,
+            "params_used": server_defaults,
+            "label": None,
+        },
+        mask_hw,
+    )
+
+
 def main():
     context = zmq.Context()
-    socket = context.socket(zmq.REP) #REP sends replies when it gets something and is paired with a REQ socket that sends requests
-    #socket.bind("tcp://*:8091") #Yuhan self.socket.bind(f"tcp://*:{port}")
-    # socket.bind("tcp://0.0.0.0:8091")
-    socket.bind("tcp://0.0.0.0:9080")
+    socket = context.socket(zmq.REP)
+    socket.bind("tcp://0.0.0.0:8091")
 
-    #while True:
-    #    if socket.poll(timeout=500):
-    #        print("socket poll == True")
+    if torch.cuda.is_available():
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
-    #Their code:
-    """
-    Step 1: Environment settings and model initialization
-    """
-    # use bfloat16 for the entire notebook
-    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-
-    if torch.cuda.get_device_properties(0).major >= 8:
-        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+    if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # init sam image predictor and video predictor model
     sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
     model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
@@ -248,184 +455,202 @@ def main():
     sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
     image_predictor = SAM2ImagePredictor(sam2_image_model)
 
-
-    # init grounding dino model from huggingface
     model_id = "IDEA-Research/grounding-dino-base"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     processor = AutoProcessor.from_pretrained(model_id)
-    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
+    grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+        model_id
+    ).to(device)
 
-    #This results in video_predictor, image_predicotr, processor, grounding_model
+    server_defaults = _default_server_params()
+    inference_state_holder = [None]
+    target_text_holder = [None]
 
-    #My code:
-    print("Server is ready...")
-    inference_state = None
-    target_text = None
-    input_boxes = None
-    max_index = None
+    print("GSAM server ready on tcp://0.0.0.0:8091 (REP)")
+
     while True:
         print("Waiting for message")
-        message_parts = socket.recv_multipart(flags=0) #Receiving text and image bytes
-        text_data = message_parts[0].decode() #No need to specify size using zmq
-        print("string received", text_data)
-        #Second get the image inp
-        image_data = message_parts[1] #No need to specify size using zmq
-        ground = message_parts[2] == True.to_bytes(length=1, byteorder='big')
-        image_pil = Image.open(io.BytesIO(image_data))
-        image_prepared, video_height, video_width = load_single_image(image_pil, 1024)
-        print("image loaded")
-        #(processor, grounding_model, video_predictor, image_predictor, device, text, raw_image_inp, image_inp, video_height, video_width)
-        if text_data:
-            target_text = text_data
-        if ground or (inference_state is None and target_text is not None):
-            print("first step")
-            masks, inference_state, input_boxes, max_index = first_step(processor, grounding_model, video_predictor, image_predictor, device, target_text, image_pil, image_prepared, video_height, video_width)
-        else:
-            masks = None
-            if inference_state is not None:
-                print("another frame")
-                masks, inference_state = new_frame(video_predictor, inference_state, image_prepared)
+        message_parts = socket.recv_multipart(flags=0)
+        if not message_parts:
+            continue
 
-        #masks=masks.cpu().numpy() don't need this as it already is a np array
-        if masks is None:
-            mask_bytes = b'\x00'
-            dtype = None
-            shape = [0]
-        else:
-            mask_bytes = masks.tobytes()
-            dtype = str(masks.dtype)
-            shape = masks.shape
-        metadata = {
-            "dtype": dtype,
-            "shape": shape
-        }
-        
-        metadata_json = json.dumps(metadata)
+        cmd = message_parts[0]
 
-        # input_boxes_bytes = input_boxes.tobytes()
-        # input_boxes_dtype = str(input_boxes.dtype)
-        # input_boxes_shape = input_boxes.shape
-        # metadata_input_boxes = {
-        #     "dtype": input_boxes_dtype,
-        #     "shape": input_boxes_shape
-        # }
-        # json_input_boxes = json.dumps(metadata_input_boxes)
+        if cmd == b"set_config" and len(message_parts) >= 2:
+            try:
+                upd = json.loads(message_parts[1].decode("utf-8"))
+                server_defaults = merge_gsam_params(server_defaults, upd)
+                socket.send_multipart(
+                    [
+                        json.dumps(
+                            {"ok": True, "applied": server_defaults}
+                        ).encode("utf-8")
+                    ]
+                )
+            except Exception as e:
+                socket.send_multipart(
+                    [
+                        json.dumps({"ok": False, "reason": str(e)}).encode(
+                            "utf-8"
+                        )
+                    ]
+                )
+            continue
 
-        #Serialized mask back with its metadata first
-        send_message_parts = [metadata_json.encode(), mask_bytes, str(max_index).encode('utf-8')]#, json_input_boxes.encode(), input_boxes_bytes]
-        #socket.send_json(metadata)
-        #socket.send(mask_bytes) 
-        socket.send_multipart(send_message_parts)
+        if cmd == b"segment" and len(message_parts) >= 3:
+            try:
+                spec = json.loads(message_parts[1].decode("utf-8"))
+            except Exception as e:
+                _reply(socket, {"ok": False, "reason": f"bad_json:{e}"}, None)
+                continue
 
-#Take the image in, laod it properly and save it into a list of images, pass the images in individually one by one
-def reference():
-    #some loop for waiting for a signal from the server
-    #Remember not to use snipping tool with different sizes as they must be the same size
-    images = []
-    for o in range(1, 4):
-        #image_path = convert_to_jpeg(f"0000{o}.png", f"0000{o}.jpg")
-        image_path = f"0000{o}.jpg"
-        # image = Image.open(image_path).convert("RGB")
-        # buffer = io.BytesIO()
-        # image.save(buffer, format="JPEG")
-        # img_bytes = buffer.getvalue()
-        # buffer.close()
-        # images.append(img_bytes)
-        image, video_height, video_width = load_single_image(image_path, 1024)
-        images.append(image)
+            image_data = message_parts[2]
+            image_pil = Image.open(io.BytesIO(image_data))
+            image_prepared, video_height, video_width = load_single_image(
+                image_pil, 1024
+            )
 
-    video_predictor, inference_state, masks1, segments1 = first_step("car.", images[0], "00001.jpg", video_height, video_width)
-    print("mask shapes", masks1.shape)
-    print("inference state 1", summarize_dict(inference_state))
-    video_predictor, inference_state, masks2, segments2 = new_frame(video_predictor, inference_state, images[1])
-    print("mask shapes", masks2.shape)
-    print("inference state 2", summarize_dict(inference_state))
-    video_predictor, inference_state, masks3, segments3 = new_frame(video_predictor, inference_state, images[2])
-    print("mask shapes", masks3.shape)
-    print("inference state 3", summarize_dict(inference_state))
+            mode = spec.get("mode", "segment")
+            target_text = spec.get("target_text") or target_text_holder[0]
+            if not target_text:
+                _reply(socket, {"ok": False, "reason": "no_target_text"}, None)
+                continue
+            target_text_holder[0] = target_text
 
-    masks_list = [masks1, masks2, masks3]
-    print(torch.equal(torch.tensor(masks1), torch.tensor(masks2)), torch.equal(torch.tensor(masks2), torch.tensor(masks3)))
-    segments_list = [segments1, segments2, segments3]
+            req_params = merge_gsam_params(
+                server_defaults, spec.get("params") or {}
+            )
+            allow_fallback = bool(spec.get("allow_fallback", True))
+            fallback_steps = spec.get("fallback_steps") or [
+                {
+                    "box_threshold": 0.12,
+                    "text_threshold": 0.18,
+                    "min_best_score": 0.22,
+                },
+                {
+                    "box_threshold": 0.08,
+                    "text_threshold": 0.12,
+                    "min_best_score": 0.12,
+                },
+            ]
 
-    for o in range(1, 4):
-        masks = masks_list[o-1]
-        segments = segments_list[o-1]
-        img = cv2.imread(f"0000{o}.jpg")
-        object_ids = list(segments.keys())
+            max_f = int(req_params["max_frames_in_state"])
 
-        detections = sv.Detections(
-            xyxy=sv.mask_to_xyxy(masks),  # (n, 4)
-            mask=masks, # (n, h, w)
-            class_id=np.array(object_ids, dtype=np.int32),
+            if mode == "track":
+                if inference_state_holder[0] is None:
+                    _reply(
+                        socket,
+                        {
+                            "ok": False,
+                            "reason": "no_state_need_segment",
+                            "params_used": req_params,
+                        },
+                        None,
+                    )
+                    continue
+                mask_hw, inf = new_frame(
+                    video_predictor,
+                    inference_state_holder[0],
+                    image_prepared,
+                    max_f,
+                )
+                inference_state_holder[0] = inf
+                if mask_hw is None:
+                    _reply(
+                        socket,
+                        {
+                            "ok": False,
+                            "reason": "tracking_failed",
+                            "params_used": req_params,
+                        },
+                        None,
+                    )
+                    continue
+                meta = {
+                    "ok": True,
+                    "reason": "ok",
+                    "used_fallback": False,
+                    "params_used": req_params,
+                    "best_score": None,
+                    "label": None,
+                }
+                _reply(socket, meta, mask_hw)
+                continue
+
+            # mode == segment
+            mask_hw, inf, meta = run_segment_with_fallback(
+                processor,
+                grounding_model,
+                video_predictor,
+                image_predictor,
+                device,
+                target_text,
+                image_pil,
+                image_prepared,
+                video_height,
+                video_width,
+                req_params,
+                allow_fallback,
+                fallback_steps,
+            )
+            if meta.get("ok"):
+                inference_state_holder[0] = inf
+            else:
+                inference_state_holder[0] = None
+            _reply(socket, meta, mask_hw)
+            continue
+
+        # Legacy protocol
+        _handle_legacy_request(
+            socket,
+            message_parts,
+            processor,
+            grounding_model,
+            video_predictor,
+            image_predictor,
+            device,
+            server_defaults,
+            inference_state_holder,
+            target_text_holder,
         )
-        box_annotator = sv.BoxAnnotator()
-        annotated_frame = box_annotator.annotate(scene=img.copy(), detections=detections)
-        mask_annotator = sv.MaskAnnotator()
-        annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
-        cv2.imwrite(f"output0000{o}.jpg", annotated_frame)
-
-    # for o in range(1, 4):
-    #     img = cv2.imread(f"track{o}.jpg")
-
-    #     print("o", o)
-    #     print("mask shape", masks[2].shape)
-    #     for mask in masks[o-1]:
-    #         mask = (mask > 0.5).astype(np.uint8)
-    #         print("mask shape", mask.shape)
-    #         color = np.random.randint(0, 255, (3,), dtype=np.uint8)  # Random color
-    #         colored_mask = np.zeros_like(img, dtype=np.uint8)
-    #         print("colored mask shape in full", colored_mask.shape)
-    #         for c in range(3):
-    #             print("colored mask shape", colored_mask[:, :, c].shape, "color shape", color[c].shape)
-    #             colored_mask[:, :, c] = mask * color[c]
-    #         img = cv2.addWeighted(img, 0.9, colored_mask, 0.1, 0)
-    #     cv2.imwrite(f"trackresult{o}.jpg", img)
 
 
 if __name__ == "__main__":
     main()
-    
+
 
 def summarize_dict(data):
-    """
-    Recursively summarize a dictionary, replacing tensor or array values with their shapes.
-    
-    Args:
-        data (dict): The dictionary to process.
-        
-    Returns:
-        dict: A summarized dictionary.
-    """
     def summarize_value(value):
-        if isinstance(value, torch.Tensor):  # Check for PyTorch tensors
+        if isinstance(value, torch.Tensor):
             return f"Tensor shape: {tuple(value.shape)}"
-        elif isinstance(value, np.ndarray):  # Check for NumPy arrays
+        elif isinstance(value, np.ndarray):
             return f"Array shape: {value.shape}"
-        elif isinstance(value, dict):  # Recursively process nested dictionaries
+        elif isinstance(value, dict):
             return summarize_dict(value)
         elif isinstance(value, list):
             return len(value)
         elif isinstance(value, tuple):
             return tuple(summarize_value(item) for item in value)
         else:
-            return value  # Leave other types unchanged
-    
+            return value
+
     return {key: summarize_value(val) for key, val in data.items()}
+
 
 def convert_to_jpeg(png_path, jpeg_path, background_color=(255, 255, 255)):
     with Image.open(png_path) as img:
-        # Handle transparency by adding a background
-        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        if img.mode in ("RGBA", "LA") or (
+            img.mode == "P" and "transparency" in img.info
+        ):
             background = Image.new("RGB", img.size, background_color)
-            background.paste(img, mask=img.split()[-1])  # Use alpha channel as mask
+            background.paste(img, mask=img.split()[-1])
             img = background
         else:
-            img = img.convert("RGB")  # Ensure RGB mode
+            img = img.convert("RGB")
         img.save(jpeg_path, "JPEG")
     return jpeg_path
 
-#def visualize()
+
 """
 Step 5: Visualize the segment results across the video and save them
 
@@ -438,11 +663,11 @@ if not os.path.exists(save_dir):
 ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
 for frame_idx, segments in video_segments.items():
     img = cv2.imread(os.path.join(video_dir, frame_names[frame_idx]))
-    
+
     object_ids = list(segments.keys())
     masks = list(segments.values())
     masks = np.concatenate(masks, axis=0)
-    
+
     detections = sv.Detections(
         xyxy=sv.mask_to_xyxy(masks),  # (n, 4)
         mask=masks, # (n, h, w)

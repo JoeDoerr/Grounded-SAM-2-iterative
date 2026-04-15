@@ -7,9 +7,9 @@ import json
 import time
 import random
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
-#Get two segmentations of the same scene. Check each mask against each other mask. Remove masks that overlap too much from the all-mask. 
-import numpy as np
+#Get two segmentations of the same scene. Check each mask against each other mask. Remove masks that overlap too much from the all-mask.
 
 def track_two(image_1, image_2):
     pass
@@ -17,6 +17,58 @@ def track_two(image_1, image_2):
 #Send it in both directions, keeping T-W and W-T. Then compare overlaps between the two T images and two W images.
 #The ids that overlap above a threshold will have their masks put together as a single object for both T and W. 
 #Mask by bits
+
+def normalize_gsam_target_name(raw: str) -> str:
+    t = (raw or "").strip().lower()
+    if not t.endswith("."):
+        t = t + "."
+    return t
+
+
+def send_segment_v2(
+    socket: zmq.Socket,
+    image: Image.Image,
+    target_text: str,
+    mode: str,
+    params: Optional[Dict[str, Any]] = None,
+    allow_fallback: bool = True,
+    fallback_steps: Optional[list] = None,
+) -> Tuple[Dict[str, Any], Optional[np.ndarray]]:
+    """
+    New ZMQ protocol (pairs with server_gsam.py on port 8091):
+      [b"segment", json_bytes, jpeg_bytes]
+    Response: [json_bytes, mask_bytes] with mask uint8 (H,W) when ok.
+    """
+    if image.mode == "RGBA":
+        image = image.convert("RGB")
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=92)
+    image_data = buf.getvalue()
+    spec: Dict[str, Any] = {
+        "target_text": normalize_gsam_target_name(target_text),
+        "mode": mode,
+        "params": params or {},
+        "allow_fallback": allow_fallback,
+    }
+    if fallback_steps is not None:
+        spec["fallback_steps"] = fallback_steps
+    socket.send_multipart(
+        [b"segment", json.dumps(spec).encode("utf-8"), image_data]
+    )
+    parts = socket.recv_multipart()
+    meta = json.loads(parts[0].decode("utf-8"))
+    if not meta.get("ok"):
+        return meta, None
+    mask = np.frombuffer(parts[1], dtype=np.dtype(meta["mask_dtype"])).reshape(
+        tuple(meta["mask_shape"])
+    )
+    return meta, mask
+
+
+def push_server_config(socket: zmq.Socket, params: Dict[str, Any]) -> Dict[str, Any]:
+    socket.send_multipart([b"set_config", json.dumps(params).encode("utf-8")])
+    return json.loads(socket.recv_multipart()[0].decode("utf-8"))
+
 
 def remove_target_mask(instance_masks, target_mask, threshold=0.9):
     """
@@ -46,36 +98,21 @@ def remove_target_mask(instance_masks, target_mask, threshold=0.9):
     return np.stack(keep_masks) if keep_masks else np.zeros((0, *target_mask.shape), dtype=instance_masks.dtype)
 
 def send_one(image, send_string, socket, do_not_track=0, boxes_use=False):
-    #image = Image.open(image_path)
-    if image.mode == 'RGBA':
-        image = image.convert('RGB')
-    image_stream = io.BytesIO()
-    image.save(image_stream, format="JPEG")  #Save image in JPEG format
-    image_data = image_stream.getvalue()  #Get byte data
-    #socket.send(image_data) #Send the serialized image
-
-    message = [send_string.encode(), image_data, do_not_track.to_bytes(length=1, byteorder='big')]
-    socket.send_multipart(message) #SENDING text and image
-    print("sent")
-
-    #To receive it blocks until it receives
-    message_parts = socket.recv_multipart() #RECEIVING metadata for masks and mask bytes
-    metadata = message_parts[0].decode()  # Decode as string
-    metadata = json.loads(metadata)
-    print(f"Received metadata: {metadata}")
-    #Bytes
-    mask_bytes = message_parts[1]
-    # Deserialize the mask
-    masks = np.frombuffer(mask_bytes, dtype=metadata["dtype"]).reshape(metadata["shape"])
-
-    #Boxes
-    if boxes_use == True:
-        box_metadata = json.loads(message_parts[2].decode())
-        box_bytes = message_parts[3]
-        boxes = np.frombuffer(box_bytes, dtype=box_metadata["dtype"]).reshape(box_metadata["shape"]) #[x0, y0, x1, y1] format
-        return masks, boxes
-    else:
-        return masks
+    """
+    Legacy helper: maps to ZMQ multipart [text, jpeg, byte] on the server.
+    do_not_track=True -> force segmentation (0x01). Returns (H,W) uint8 mask or raises if boxes_use.
+    """
+    if boxes_use:
+        raise NotImplementedError("box return path not supported on current server reply.")
+    mode = "segment" if int(do_not_track) else "track"
+    meta, mask = send_segment_v2(socket, image, send_string, mode=mode)
+    print(f"Received metadata: {meta}")
+    if not meta.get("ok") or mask is None:
+        return np.zeros((0, 1, 1), dtype=np.uint8)
+    m = (mask > 127).astype(np.uint8) if mask.dtype == np.uint8 else (mask > 0.5).astype(np.uint8)
+    if m.ndim == 2:
+        m = m[np.newaxis, ...]
+    return m
 
 def instance_and_target_masks_to_one_mask(instance_mask, target_mask):
     """
@@ -100,16 +137,24 @@ def instance_and_target_masks_to_one_mask(instance_mask, target_mask):
 def send_instance_and_target(img, tar_string, socket):
     mask_instance = send_one(img, "Object.", socket, do_not_track=True)
     mask_target = send_one(img, tar_string, socket, do_not_track=True)
-    mask_instance = remove_target_mask(mask_instance, mask_target)
-    encoded_instance_mask = instance_and_target_masks_to_one_mask(mask_instance, mask_target)
+    if mask_target.shape[0] == 0:
+        target_hw = np.zeros((1, 1), dtype=np.uint8)
+    else:
+        target_hw = mask_target[0]
+    mask_instance = remove_target_mask(mask_instance, target_hw)
+    if mask_instance.shape[0] == 0:
+        encoded_instance_mask = target_hw.astype(np.int32)
+    else:
+        encoded_instance_mask = instance_and_target_masks_to_one_mask(
+            mask_instance, target_hw
+        )
     return mask_instance, mask_target, encoded_instance_mask
 
 def prep_and_send():
     context = zmq.Context()
     socket = context.socket(zmq.REQ) #Make sure to use REQ
     print("trying to connect to port")
-    #socket.connect("tcp://:8091")
-    socket.connect("tcp://0.0.0.0:8091")
+    socket.connect("tcp://127.0.0.1:8091")
     print("Client connected")
     send_strings = ["Object.", "Object."]
     paths = ["test_segmentation_images/scene7_wrist.jpg", "test_segmentation_images/scene7_head.jpg"]
@@ -121,8 +166,13 @@ def prep_and_send():
         if i % 2 == 0: #Purposely want it to run object detection again when it is the first run, so I can keep the gsam running and continue restarting the object detection from there
             do_not_track = True
         #Do not track means that for this given image don't track it from the previous one
-        masks, boxes = send_one(image, send_string, socket, do_not_track=do_not_track)
-        make_seg_img(masks, image_path, tag=i)
+        mode = "segment" if do_not_track else "track"
+        meta, mask = send_segment_v2(socket, image, send_string, mode=mode)
+        print(meta)
+        if mask is None:
+            print("no mask")
+            continue
+        make_seg_img(np.stack([mask], axis=0), image_path, tag=i)
 
 def make_seg_img(masks, image_path, tag=0, boxes=None):
     img = cv2.imread(image_path)
@@ -130,7 +180,7 @@ def make_seg_img(masks, image_path, tag=0, boxes=None):
     i = -1
     for mask in masks:
         i += 1
-        mask = (mask > 0.5).astype(np.uint8)
+        mask = (mask > 127).astype(np.uint8) if mask.dtype == np.uint8 else (mask > 0.5).astype(np.uint8)
         bold_colors = [
             (255, 0, 0),      # Red
             (0, 255, 0),      # Green
@@ -181,7 +231,7 @@ def main():
     socket = context.socket(zmq.REQ) #Make sure to use REQ
     print("trying to connect to port")
     #socket.connect("tcp://:8091")
-    socket.connect("tcp://0.0.0.0:8091")
+    socket.connect("tcp://127.0.0.1:8091")
     print("Client connected")
 
     num_pics=1#3
