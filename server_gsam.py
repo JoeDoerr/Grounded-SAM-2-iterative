@@ -53,7 +53,7 @@ def _default_server_params():
         "min_best_score": 0.35,
         "box_overlap_filter_threshold": 0.9,
         "max_inside": 3,
-        "max_frames_in_state": 5,
+        "max_frames_in_state": 2,
         "nms_iou_threshold": 0.7,
     }
 
@@ -99,7 +99,7 @@ def first_step(
     results = processor.post_process_grounded_object_detection(
         outputs,
         inputs.input_ids,
-        box_threshold=float(p["box_threshold"]),
+        threshold=float(p["box_threshold"]),
         text_threshold=float(p["text_threshold"]),
         target_sizes=[image.size[::-1]],
     )
@@ -133,25 +133,25 @@ def first_step(
 
     label_one = labels[best_i] if hasattr(labels, "__getitem__") else labels
 
-    image_predictor.set_image(np.array(image.convert("RGB")))
-    masks, sam_scores, logits = image_predictor.predict(
-        point_coords=None,
-        point_labels=None,
-        box=input_boxes,
-        multimask_output=False,
-    )
-
-    if masks.ndim == 3:
-        masks = masks[None]
-    elif masks.ndim == 4:
-        masks = masks.squeeze(1)
-
-    if masks is None or masks.shape[0] == 0:
-        meta["reason"] = "sam_empty"
-        return None, None, meta
-
     PROMPT_TYPE_FOR_VIDEO = "box"
-    assert PROMPT_TYPE_FOR_VIDEO in ["point", "box", "mask"]
+
+    if PROMPT_TYPE_FOR_VIDEO in ("point", "mask"):
+        image_predictor.set_image(np.array(image.convert("RGB")))
+        masks, sam_scores, logits = image_predictor.predict(
+            point_coords=None,
+            point_labels=None,
+            box=input_boxes,
+            multimask_output=False,
+        )
+        if masks.ndim == 3:
+            masks = masks[None]
+        elif masks.ndim == 4:
+            masks = masks.squeeze(1)
+        if masks is None or masks.shape[0] == 0:
+            meta["reason"] = "sam_empty"
+            return None, None, meta
+    else:
+        masks = None
 
     if PROMPT_TYPE_FOR_VIDEO == "point":
         all_sample_points = sample_points_from_masks(masks=masks, num_points=10)
@@ -361,7 +361,9 @@ def _handle_legacy_request(
         force_segment = message_parts[2] == b"\x01"
 
     image_pil = Image.open(io.BytesIO(image_data))
-    image_prepared, video_height, video_width = load_single_image(image_pil, 1024)
+    image_prepared, video_height, video_width = load_single_image(
+        image_pil, 1024, compute_device=device
+    )
 
     if text_data:
         target_text_holder[0] = text_data
@@ -441,29 +443,42 @@ def main():
     socket = context.socket(zmq.REP)
     socket.bind("tcp://0.0.0.0:8091")
 
+    # Detect backend: ROCm/HIP reports as CUDA in PyTorch but needs different flags.
+    _is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        backend = "ROCm/HIP" if _is_rocm else "CUDA"
+        print(f"Using device: {device} ({backend}) — {gpu_name}")
+    else:
+        print("Using device: cpu")
+
     if torch.cuda.is_available():
         torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
-    if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    if torch.cuda.is_available() and not _is_rocm:
+        # tf32 is only available on NVIDIA Ampere+ (compute capability >= 8.0).
+        props = torch.cuda.get_device_properties(0)
+        if props.major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
-    sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-    model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    sam2_checkpoint = "./checkpoints/sam2.1_hiera_small.pt"
+    model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
 
-    video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
-    sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
+    video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
+    sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
     image_predictor = SAM2ImagePredictor(sam2_image_model)
 
     model_id = "IDEA-Research/grounding-dino-base"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     processor = AutoProcessor.from_pretrained(model_id)
     grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
         model_id
     ).to(device)
 
     server_defaults = _default_server_params()
-    inference_state_holder = [None]
+    # Keyed by target_text so each object label has its own tracking state.
+    inference_states: dict = {}
     target_text_holder = [None]
 
     print("GSAM server ready on tcp://0.0.0.0:8091 (REP)")
@@ -507,7 +522,7 @@ def main():
             image_data = message_parts[2]
             image_pil = Image.open(io.BytesIO(image_data))
             image_prepared, video_height, video_width = load_single_image(
-                image_pil, 1024
+                image_pil, 1024, compute_device=device
             )
 
             mode = spec.get("mode", "segment")
@@ -537,7 +552,8 @@ def main():
             max_f = int(req_params["max_frames_in_state"])
 
             if mode == "track":
-                if inference_state_holder[0] is None:
+                state = inference_states.get(target_text)
+                if state is None:
                     _reply(
                         socket,
                         {
@@ -550,11 +566,11 @@ def main():
                     continue
                 mask_hw, inf = new_frame(
                     video_predictor,
-                    inference_state_holder[0],
+                    state,
                     image_prepared,
                     max_f,
                 )
-                inference_state_holder[0] = inf
+                inference_states[target_text] = inf
                 if mask_hw is None:
                     _reply(
                         socket,
@@ -594,9 +610,9 @@ def main():
                 fallback_steps,
             )
             if meta.get("ok"):
-                inference_state_holder[0] = inf
+                inference_states[target_text] = inf
             else:
-                inference_state_holder[0] = None
+                inference_states.pop(target_text, None)
             _reply(socket, meta, mask_hw)
             continue
 
