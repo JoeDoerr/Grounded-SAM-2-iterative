@@ -309,32 +309,30 @@ def run_segment_with_fallback(
     return None, None, last_meta
 
 
+def _result_meta(meta: dict, mask_hw: Optional[np.ndarray], mask_part_index=None):
+    ok = mask_hw is not None and meta.get("ok")
+    meta_out = {
+        "ok": bool(ok),
+        "reason": meta.get("reason", "ok" if ok else "error"),
+        "used_fallback": bool(meta.get("used_fallback", False)),
+        "params_used": meta.get("params_used"),
+        "mask_dtype": "uint8" if ok else None,
+        "mask_shape": list(mask_hw.shape) if ok else [],
+        "best_score": meta.get("best_score"),
+        "label": meta.get("label"),
+    }
+    if mask_part_index is not None:
+        meta_out["mask_part_index"] = mask_part_index
+    return meta_out
+
+
 def _reply(socket, meta: dict, mask_hw: Optional[np.ndarray]):
     if mask_hw is not None and meta.get("ok"):
-        mask_u8 = (mask_hw.astype(np.uint8) * 255)
-        mask_bytes = mask_u8.tobytes()
-        meta_out = {
-            "ok": True,
-            "reason": meta.get("reason", "ok"),
-            "used_fallback": bool(meta.get("used_fallback", False)),
-            "params_used": meta.get("params_used"),
-            "mask_dtype": str(mask_u8.dtype),
-            "mask_shape": list(mask_u8.shape),
-            "best_score": meta.get("best_score"),
-            "label": meta.get("label"),
-        }
+        mask_bytes = (mask_hw.astype(np.uint8) * 255).tobytes()
+        meta_out = _result_meta(meta, mask_hw)
     else:
         mask_bytes = b""
-        meta_out = {
-            "ok": False,
-            "reason": meta.get("reason", "error"),
-            "used_fallback": bool(meta.get("used_fallback", False)),
-            "params_used": meta.get("params_used"),
-            "mask_dtype": None,
-            "mask_shape": [],
-            "best_score": meta.get("best_score"),
-            "label": meta.get("label"),
-        }
+        meta_out = _result_meta(meta, None)
     socket.send_multipart([json.dumps(meta_out).encode("utf-8"), mask_bytes])
 
 
@@ -614,6 +612,142 @@ def main():
             else:
                 inference_states.pop(target_text, None)
             _reply(socket, meta, mask_hw)
+            continue
+
+        if cmd == b"batch_segment" and len(message_parts) >= 3:
+            try:
+                spec = json.loads(message_parts[1].decode("utf-8"))
+            except Exception as e:
+                socket.send_multipart(
+                    [
+                        json.dumps(
+                            {"ok": False, "reason": f"bad_json:{e}", "results": []}
+                        ).encode("utf-8")
+                    ]
+                )
+                continue
+
+            requests = spec.get("requests") or []
+            if not requests:
+                socket.send_multipart(
+                    [
+                        json.dumps(
+                            {"ok": False, "reason": "no_requests", "results": []}
+                        ).encode("utf-8")
+                    ]
+                )
+                continue
+
+            image_data = message_parts[2]
+            image_pil = Image.open(io.BytesIO(image_data))
+            image_prepared, video_height, video_width = load_single_image(
+                image_pil, 1024, compute_device=device
+            )
+
+            results = []
+            mask_parts = []
+            for req in requests:
+                mode = req.get("mode", "segment")
+                target_text = req.get("target_text")
+                if not target_text:
+                    results.append(
+                        _result_meta({"ok": False, "reason": "no_target_text"}, None)
+                    )
+                    continue
+
+                req_params = merge_gsam_params(
+                    server_defaults, req.get("params") or {}
+                )
+                allow_fallback = bool(req.get("allow_fallback", True))
+                fallback_steps = req.get("fallback_steps") or [
+                    {
+                        "box_threshold": 0.12,
+                        "text_threshold": 0.18,
+                        "min_best_score": 0.22,
+                    },
+                    {
+                        "box_threshold": 0.08,
+                        "text_threshold": 0.12,
+                        "min_best_score": 0.12,
+                    },
+                ]
+                max_f = int(req_params["max_frames_in_state"])
+
+                if mode == "track":
+                    state = inference_states.get(target_text)
+                    if state is None:
+                        results.append(
+                            _result_meta(
+                                {
+                                    "ok": False,
+                                    "reason": "no_state_need_segment",
+                                    "params_used": req_params,
+                                },
+                                None,
+                            )
+                        )
+                        continue
+                    mask_hw, inf = new_frame(
+                        video_predictor,
+                        state,
+                        image_prepared,
+                        max_f,
+                    )
+                    inference_states[target_text] = inf
+                    if mask_hw is None:
+                        results.append(
+                            _result_meta(
+                                {
+                                    "ok": False,
+                                    "reason": "tracking_failed",
+                                    "params_used": req_params,
+                                },
+                                None,
+                            )
+                        )
+                        continue
+                    meta = {
+                        "ok": True,
+                        "reason": "ok",
+                        "used_fallback": False,
+                        "params_used": req_params,
+                        "best_score": None,
+                        "label": None,
+                    }
+                else:
+                    mask_hw, inf, meta = run_segment_with_fallback(
+                        processor,
+                        grounding_model,
+                        video_predictor,
+                        image_predictor,
+                        device,
+                        target_text,
+                        image_pil,
+                        image_prepared,
+                        video_height,
+                        video_width,
+                        req_params,
+                        allow_fallback,
+                        fallback_steps,
+                    )
+                    if meta.get("ok"):
+                        inference_states[target_text] = inf
+                    else:
+                        inference_states.pop(target_text, None)
+
+                if mask_hw is not None and meta.get("ok"):
+                    mask_part_index = len(mask_parts)
+                    mask_parts.append((mask_hw.astype(np.uint8) * 255).tobytes())
+                    results.append(_result_meta(meta, mask_hw, mask_part_index))
+                else:
+                    results.append(_result_meta(meta, None))
+
+            socket.send_multipart(
+                [
+                    json.dumps({"ok": True, "results": results}).encode("utf-8"),
+                    *mask_parts,
+                ]
+            )
             continue
 
         # Legacy protocol
