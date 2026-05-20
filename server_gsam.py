@@ -218,6 +218,158 @@ def update_inference_state(inference_state, frame, max_frames: int):
     return inference_state
 
 
+def first_step_multi(
+    processor,
+    grounding_model,
+    video_predictor,
+    image_predictor,
+    device,
+    text,
+    raw_image_inp,
+    image_inp,
+    video_height,
+    video_width,
+    p: dict,
+):
+    """
+    Like first_step but keeps ALL boxes above min_best_score (not just the best one).
+    Returns list of (mask_hw, inference_state, object_id) for each detected instance,
+    plus meta dict. Each instance gets its own SAM2 inference state for independent tracking.
+    """
+    meta = {"ok": False, "reason": "unknown", "best_score": None, "params_used": dict(p)}
+
+    image = raw_image_inp
+
+    inputs = processor(images=image, text=text, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = grounding_model(**inputs)
+
+    results = processor.post_process_grounded_object_detection(
+        outputs,
+        inputs.input_ids,
+        threshold=float(p["box_threshold"]),
+        text_threshold=float(p["text_threshold"]),
+        target_sizes=[image.size[::-1]],
+    )
+
+    scores = results[0]["scores"].cpu().numpy()
+    input_boxes = results[0]["boxes"].cpu().numpy()
+    labels = results[0]["labels"]
+    print("instance_segment objects", labels, "scores", scores, "num_boxes", len(input_boxes))
+
+    if len(input_boxes) == 0:
+        meta["reason"] = "no_boxes"
+        return [], meta
+
+    # Keep all boxes above min_best_score
+    keep_mask = scores >= float(p["min_best_score"])
+    if not np.any(keep_mask):
+        meta["best_score"] = float(np.max(scores))
+        meta["reason"] = "all_scores_below_threshold"
+        return [], meta
+
+    kept_boxes = input_boxes[keep_mask]
+    kept_scores = scores[keep_mask]
+
+    # Filter overlapping boxes
+    filtered = filter_boxes(
+        kept_boxes,
+        threshold=float(p["box_overlap_filter_threshold"]),
+        max_inside=int(p["max_inside"]),
+    )
+    if filtered.shape[0] == 0:
+        meta["reason"] = "filtered_empty"
+        return [], meta
+
+    meta["ok"] = True
+    meta["reason"] = "ok"
+    meta["best_score"] = float(np.max(kept_scores))
+    meta["num_instances"] = int(filtered.shape[0])
+
+    # Create a separate inference state for each instance
+    instances = []
+    for obj_idx, box in enumerate(filtered):
+        inference_state = video_predictor.non_video_path_init_state(
+            image_inp, video_height, video_width
+        )
+        object_id = obj_idx + 1
+        video_predictor.add_new_points_or_box(
+            inference_state=inference_state,
+            frame_idx=0,
+            obj_id=object_id,
+            box=box,
+        )
+
+        video_segments = {}
+        for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
+            inference_state
+        ):
+            video_segments[out_frame_idx] = {
+                out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                for i, out_obj_id in enumerate(out_obj_ids)
+            }
+
+        if not video_segments:
+            continue
+        _, segments = next(iter(video_segments.items()))
+        mask_list = list(segments.values())
+        if not mask_list:
+            continue
+        stacked = np.concatenate(mask_list, axis=0)
+        mask_hw = np.any(stacked, axis=0).astype(np.bool_)
+        instances.append((mask_hw, inference_state, object_id))
+
+    if not instances:
+        meta["ok"] = False
+        meta["reason"] = "propagate_empty"
+    return instances, meta
+
+
+def init_from_mask_step(
+    video_predictor,
+    device,
+    mask_hw,
+    image_inp,
+    video_height,
+    video_width,
+):
+    """
+    Initialize a SAM2 tracking state on a new image using a mask from a prior detection.
+    Used to bootstrap cam2 tracking from cam1's detection result.
+    Returns (result_mask_hw, inference_state) or (None, None) on failure.
+    """
+    inference_state = video_predictor.non_video_path_init_state(
+        image_inp, video_height, video_width
+    )
+    # Use mask as prompt (same as PROMPT_TYPE_FOR_VIDEO == "mask")
+    mask_tensor = mask_hw.astype(np.float32)
+    video_predictor.add_new_mask(
+        inference_state=inference_state,
+        frame_idx=0,
+        obj_id=1,
+        mask=mask_tensor,
+    )
+
+    video_segments = {}
+    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
+        inference_state
+    ):
+        video_segments[out_frame_idx] = {
+            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+            for i, out_obj_id in enumerate(out_obj_ids)
+        }
+
+    if not video_segments:
+        return None, None
+    _, segments = next(iter(video_segments.items()))
+    mask_list = list(segments.values())
+    if not mask_list:
+        return None, None
+    stacked = np.concatenate(mask_list, axis=0)
+    result_mask = np.any(stacked, axis=0).astype(np.bool_)
+    return result_mask, inference_state
+
+
 def new_frame(video_predictor, inference_state, new_frame_tensor, max_frames: int):
     inference_state = update_inference_state(
         inference_state, new_frame_tensor, max_frames
@@ -748,6 +900,114 @@ def main():
                     *mask_parts,
                 ]
             )
+            continue
+
+        if cmd == b"instance_segment" and len(message_parts) >= 3:
+            # Returns ALL detected instances as separate masks (not just best box)
+            try:
+                spec = json.loads(message_parts[1].decode("utf-8"))
+            except Exception as e:
+                socket.send_multipart(
+                    [json.dumps({"ok": False, "reason": f"bad_json:{e}", "results": []}).encode("utf-8")]
+                )
+                continue
+
+            image_data = message_parts[2]
+            image_pil = Image.open(io.BytesIO(image_data))
+            image_prepared, video_height, video_width = load_single_image(
+                image_pil, 1024, compute_device=device
+            )
+
+            target_text = spec.get("target_text") or "object."
+            req_params = merge_gsam_params(server_defaults, spec.get("params") or {})
+            state_key_prefix = spec.get("state_key_prefix", "")
+
+            instances, meta = first_step_multi(
+                processor, grounding_model, video_predictor, image_predictor,
+                device, target_text, image_pil, image_prepared,
+                video_height, video_width, req_params,
+            )
+
+            if not instances:
+                socket.send_multipart(
+                    [json.dumps({"ok": False, "reason": meta.get("reason", "no_instances"), "results": []}).encode("utf-8")]
+                )
+                continue
+
+            # Store each instance's inference state with a unique key
+            results = []
+            mask_parts = []
+            for mask_hw, inf_state, obj_id in instances:
+                state_key = f"{state_key_prefix}{target_text}_inst{obj_id}"
+                inference_states[state_key] = inf_state
+                mask_part_index = len(mask_parts)
+                mask_parts.append((mask_hw.astype(np.uint8) * 255).tobytes())
+                results.append({
+                    "ok": True,
+                    "object_id": obj_id,
+                    "state_key": state_key,
+                    "mask_dtype": "uint8",
+                    "mask_shape": list(mask_hw.shape),
+                    "mask_part_index": mask_part_index,
+                })
+
+            socket.send_multipart(
+                [
+                    json.dumps({"ok": True, "num_instances": len(instances), "results": results}).encode("utf-8"),
+                    *mask_parts,
+                ]
+            )
+            continue
+
+        if cmd == b"init_from_mask" and len(message_parts) >= 4:
+            # Initialize tracking on a new image using a mask from a prior segment
+            # Used to bootstrap cam2 from cam1's detection
+            try:
+                spec = json.loads(message_parts[1].decode("utf-8"))
+            except Exception as e:
+                _reply(socket, {"ok": False, "reason": f"bad_json:{e}"}, None)
+                continue
+
+            mask_data = message_parts[2]
+            image_data = message_parts[3]
+
+            # Decode mask
+            mask_dtype = spec.get("mask_dtype", "uint8")
+            mask_shape = spec.get("mask_shape")
+            state_key = spec.get("state_key", "")
+            if not mask_shape or not state_key:
+                _reply(socket, {"ok": False, "reason": "missing mask_shape or state_key"}, None)
+                continue
+
+            mask_hw = np.frombuffer(mask_data, dtype=np.dtype(mask_dtype)).reshape(tuple(mask_shape))
+            mask_bool = mask_hw > 127 if mask_dtype == "uint8" else mask_hw.astype(bool)
+
+            # Prepare the new image
+            image_pil = Image.open(io.BytesIO(image_data))
+            image_prepared, video_height, video_width = load_single_image(
+                image_pil, 1024, compute_device=device
+            )
+
+            # Init tracking state from mask
+            result_mask, inf_state = init_from_mask_step(
+                video_predictor, device, mask_bool, image_prepared, video_height, video_width
+            )
+
+            if result_mask is None:
+                _reply(socket, {"ok": False, "reason": "init_from_mask_failed"}, None)
+                continue
+
+            inference_states[state_key] = inf_state
+            meta = {
+                "ok": True,
+                "reason": "ok",
+                "state_key": state_key,
+                "used_fallback": False,
+                "params_used": {},
+                "best_score": None,
+                "label": None,
+            }
+            _reply(socket, meta, result_mask)
             continue
 
         # Legacy protocol
